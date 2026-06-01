@@ -54,6 +54,38 @@ Best if you want to run on a schedule from Google's servers with Sheet logging.
 | `testLogToDashboard` | Write sample rows to the sheet (no Gmail changes) |
 | `runSetupDashboardOnly` | Create/bind dashboard spreadsheet |
 
+### Web App API
+
+Deploy as a web app to trigger cleanup or fetch a digest via HTTP POST.
+
+1. Run **`generateWebAppApiSecret`** once → copy the token to Script Properties as **`WEBAPP_API_SECRET`**
+2. **Deploy → New deployment → Web app**
+   - Execute as: **Me**
+   - Who has access: **Anyone** (requests must still include the secret token)
+3. POST JSON to the deployment URL:
+
+```json
+{ "action": "cleanup", "token": "YOUR_WEBAPP_API_SECRET" }
+```
+
+```json
+{ "action": "digest", "token": "YOUR_WEBAPP_API_SECRET" }
+```
+
+Digest response:
+
+```json
+{ "ok": true, "action": "digest", "content": "Gmail Cleanup digest (last 24 hours)\n..." }
+```
+
+### HTML dashboard
+
+1. In Apps Script, add an HTML file named **`dashboard`** (File → New → HTML) and paste [`apps-script/dashboard.html`](apps-script/dashboard.html).
+2. Deploy as **Web app** (same deployment as `doPost`).
+3. Open the deployment URL in a browser — use **Run Inbox Cleanup** and **Fetch Action Digest**.
+
+When served from Apps Script, the page uses `google.script.run` (no token in the browser). For standalone use, expand **Connection settings** and enter the Web App URL + API token.
+
 ### Dashboard
 
 - Tab: **Classification Log**

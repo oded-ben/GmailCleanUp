@@ -1,0 +1,817 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Gmail Cleanup</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;1,9..40,400&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #f4f3ef;
+      --surface: #ffffff;
+      --text: #1a1a18;
+      --muted: #6b6a65;
+      --border: #e8e6df;
+      --accent: #2d5a4a;
+      --accent-hover: #234839;
+      --accent-soft: #e8f0ec;
+      --shadow: 0 1px 2px rgba(26, 26, 24, 0.04), 0 8px 24px rgba(26, 26, 24, 0.06);
+      --radius: 14px;
+      --font: "DM Sans", system-ui, -apple-system, sans-serif;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: var(--font);
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .page {
+      max-width: 960px;
+      margin: 0 auto;
+      padding: 48px 24px 64px;
+    }
+
+    header {
+      margin-bottom: 36px;
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 16px;
+    }
+
+    .header-copy { flex: 1; }
+
+    header h1 {
+      font-size: 1.75rem;
+      font-weight: 600;
+      letter-spacing: -0.03em;
+      margin-bottom: 6px;
+    }
+
+    header p { color: var(--muted); font-size: 0.95rem; }
+
+    .settings-toggle {
+      font-family: var(--font);
+      font-size: 0.8125rem;
+      font-weight: 500;
+      color: var(--muted);
+      background: none;
+      border: none;
+      padding: 6px 0;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+
+    .settings-toggle:hover { color: var(--accent); }
+
+    details.settings.hidden { display: none; }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      padding: 28px;
+      margin-bottom: 20px;
+    }
+
+    .actions { display: flex; flex-wrap: wrap; gap: 12px; }
+
+    .option-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-top: 16px;
+      font-size: 0.875rem;
+    }
+
+    .option-row input[type="checkbox"] {
+      width: 16px;
+      height: 16px;
+      accent-color: var(--accent);
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+
+    .option-row label {
+      cursor: pointer;
+      user-select: none;
+    }
+
+    .option-hint {
+      font-size: 0.75rem;
+      color: var(--muted);
+      margin-top: 12px;
+    }
+
+    .confirm-panel {
+      margin-top: 16px;
+      padding: 16px 18px;
+      border: 1px solid #e8cfc9;
+      border-radius: 10px;
+      background: #fdf6f4;
+    }
+
+    .confirm-panel.hidden { display: none; }
+
+    .confirm-panel p {
+      font-size: 0.875rem;
+      color: var(--text);
+      margin-bottom: 12px;
+    }
+
+    .confirm-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+
+    .btn-danger {
+      background: #9b3d30;
+      color: #fff;
+    }
+
+    .btn-danger:not(:disabled):hover { background: #823429; }
+
+    button {
+      font-family: var(--font);
+      font-size: 0.9375rem;
+      font-weight: 500;
+      border: none;
+      border-radius: 10px;
+      padding: 12px 20px;
+      cursor: pointer;
+      transition: background 0.15s ease, transform 0.1s ease, opacity 0.15s ease;
+    }
+
+    button:disabled { opacity: 0.55; cursor: not-allowed; }
+    button:not(:disabled):active { transform: scale(0.98); }
+
+    .btn-primary { background: var(--accent); color: #fff; }
+    .btn-primary:not(:disabled):hover { background: var(--accent-hover); }
+    .btn-secondary { background: var(--accent-soft); color: var(--accent); }
+    .btn-secondary:not(:disabled):hover { background: #dce8e2; }
+
+    .status {
+      margin-top: 16px;
+      font-size: 0.875rem;
+      color: var(--muted);
+      min-height: 1.25rem;
+    }
+
+    .status.error { color: #b54a3a; }
+    .status.success { color: var(--accent); }
+
+    .output-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 14px;
+    }
+
+    .output-header h2 {
+      font-size: 0.8125rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+    }
+
+    .output-header span { font-size: 0.75rem; color: var(--muted); }
+
+    .output-panel {
+      min-height: 120px;
+      max-height: 480px;
+      overflow: auto;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: #fafaf8;
+      scroll-behavior: smooth;
+    }
+
+    .output-panel::-webkit-scrollbar { width: 8px; height: 8px; }
+    .output-panel::-webkit-scrollbar-thumb { background: #d4d2cb; border-radius: 4px; }
+
+    .output-panel.empty {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--muted);
+      font-size: 0.9rem;
+      text-align: center;
+      padding: 24px;
+      max-height: 360px;
+    }
+
+    .message-box {
+      padding: 20px 22px;
+      font-size: 0.9375rem;
+    }
+
+    .digest-banner {
+      border-bottom: 1px solid var(--border);
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-weight: 500;
+    }
+
+    .digest-wrap { padding: 16px 18px 20px; }
+
+    .digest-head {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 14px;
+    }
+
+    .digest-head h3 {
+      font-size: 0.9375rem;
+      font-weight: 600;
+      letter-spacing: -0.02em;
+    }
+
+    .digest-head span {
+      font-size: 0.8125rem;
+      color: var(--muted);
+    }
+
+    .summary-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+
+    .summary-card {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--surface);
+      padding: 10px 12px;
+    }
+
+    .summary-card h4 {
+      font-size: 0.6875rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--muted);
+      margin-bottom: 8px;
+    }
+
+    .summary-card table {
+      width: 100%;
+      font-size: 0.8125rem;
+      border-collapse: collapse;
+    }
+
+    .summary-card td {
+      padding: 3px 0;
+      vertical-align: top;
+    }
+
+    .summary-card td:last-child {
+      text-align: right;
+      font-weight: 600;
+      color: var(--accent);
+      white-space: nowrap;
+      padding-left: 8px;
+    }
+
+    .table-scroll { overflow-x: auto; }
+
+    .digest-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.8125rem;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+
+    .digest-table thead {
+      background: #f0efe9;
+      position: sticky;
+      top: 0;
+      z-index: 1;
+    }
+
+    .digest-table th {
+      text-align: left;
+      font-size: 0.6875rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--muted);
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+
+    .digest-table td {
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+    }
+
+    .digest-table tbody tr:last-child td { border-bottom: none; }
+    .digest-table tbody tr:hover { background: #f7f6f2; }
+
+    .digest-table .col-time { white-space: nowrap; width: 1%; color: var(--muted); }
+    .digest-table .col-subject { min-width: 160px; font-weight: 500; }
+    .digest-table .col-sender { min-width: 140px; color: var(--muted); word-break: break-all; }
+    .digest-table .col-reason { min-width: 120px; color: var(--muted); }
+
+    .badge {
+      display: inline-block;
+      font-size: 0.6875rem;
+      font-weight: 600;
+      padding: 3px 8px;
+      border-radius: 999px;
+      white-space: nowrap;
+    }
+
+    .badge-delete { background: #fdecea; color: #9b3d30; }
+    .badge-keep { background: var(--accent-soft); color: var(--accent); }
+    .badge-label { background: #eef1f8; color: #3d4f7c; }
+
+    details.settings summary {
+      font-size: 0.8125rem;
+      font-weight: 500;
+      color: var(--muted);
+      cursor: pointer;
+      list-style: none;
+    }
+
+    details.settings summary::-webkit-details-marker { display: none; }
+    details.settings[open] summary { margin-bottom: 12px; }
+
+    .settings-grid { display: grid; gap: 10px; }
+
+    .settings-grid label {
+      display: grid;
+      gap: 4px;
+      font-size: 0.75rem;
+      font-weight: 500;
+      color: var(--muted);
+    }
+
+    .settings-grid input {
+      font-family: var(--font);
+      font-size: 0.875rem;
+      padding: 10px 12px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--surface);
+      color: var(--text);
+    }
+
+    .hint { font-size: 0.75rem; color: var(--muted); margin-top: 8px; }
+
+    button .btn-label { display: inline-flex; align-items: center; gap: 8px; }
+
+    button .spinner {
+      display: none;
+      width: 14px;
+      height: 14px;
+      border: 2px solid rgba(255, 255, 255, 0.35);
+      border-top-color: #fff;
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+      flex-shrink: 0;
+    }
+
+    .btn-secondary .spinner {
+      border-color: rgba(45, 90, 74, 0.25);
+      border-top-color: var(--accent);
+    }
+
+    button.is-loading .spinner { display: inline-block; }
+    button.is-loading .btn-text-default { opacity: 0.85; }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    @media (max-width: 520px) {
+      .page { padding: 32px 16px 48px; }
+      .actions { flex-direction: column; }
+      .actions button { width: 100%; }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <header>
+      <div class="header-copy">
+        <h1>Gmail Cleanup</h1>
+        <p>Rule-based triage and AI labeling for your inbox.</p>
+      </div>
+      <button type="button" class="settings-toggle" id="btnSettings" hidden>Settings</button>
+    </header>
+
+    <details class="settings card hidden" id="settingsPanel">
+      <summary>Connection settings (external access only)</summary>
+      <div class="settings-grid">
+        <label>
+          Web App URL
+          <input type="url" id="apiUrl" placeholder="https://script.google.com/macros/s/…/exec" />
+        </label>
+        <label>
+          API token
+          <input type="password" id="apiToken" placeholder="WEBAPP_API_SECRET" autocomplete="off" />
+        </label>
+      </div>
+      <p class="hint">Only needed when not opened from the Apps Script deployment. Token is stored locally in this browser.</p>
+    </details>
+
+    <section class="card">
+      <div class="actions">
+        <button type="button" class="btn-primary" id="btnCleanupUnread">
+          <span class="btn-label">
+            <span class="spinner" aria-hidden="true"></span>
+            <span class="btn-text-default">Cleanup Unread</span>
+          </span>
+        </button>
+        <button type="button" class="btn-primary" id="btnClassifyRead">
+          <span class="btn-label">
+            <span class="spinner" aria-hidden="true"></span>
+            <span class="btn-text-default">Classify Read</span>
+          </span>
+        </button>
+        <button type="button" class="btn-secondary" id="btnArchive">
+          <span class="btn-label">
+            <span class="spinner" aria-hidden="true"></span>
+            <span class="btn-text-default">Archive Reviewed Items</span>
+          </span>
+        </button>
+        <button type="button" class="btn-secondary" id="btnDigest">
+          <span class="btn-label">
+            <span class="spinner" aria-hidden="true"></span>
+            <span class="btn-text-default">View Last Run Digest</span>
+          </span>
+        </button>
+      </div>
+      <div class="confirm-panel hidden" id="archiveConfirmPanel" role="alertdialog" aria-labelledby="archiveConfirmTitle" aria-describedby="archiveConfirmDesc">
+        <p id="archiveConfirmTitle"><strong>Are you sure?</strong></p>
+        <p id="archiveConfirmDesc">This will archive every CleanupQueue email still in your inbox (read and unread). You can restore them from Gmail’s All Mail if needed.</p>
+        <div class="confirm-actions">
+          <button type="button" class="btn-danger" id="btnArchiveConfirm">Yes, archive them</button>
+          <button type="button" class="btn-secondary" id="btnArchiveCancel">Cancel</button>
+        </div>
+      </div>
+      <p class="option-hint">Unread mail is classified and archived automatically. Read mail is labeled only — use Archive when you are done reviewing.</p>
+      <p class="status" id="status" aria-live="polite"></p>
+    </section>
+
+    <section class="card">
+      <div class="output-header">
+        <h2>Results</h2>
+        <span id="outputMeta"></span>
+      </div>
+      <div class="output-panel empty" id="output">
+        Results from your last cleanup run appear here.
+      </div>
+    </section>
+  </div>
+
+  <script>
+    var SERVER_WEB_APP_URL = '<?= webAppUrl ?>';
+  </script>
+  <script>
+    (function () {
+      var STORAGE_URL = 'gmailCleanup.apiUrl';
+      var STORAGE_TOKEN = 'gmailCleanup.apiToken';
+      var useServerBridge = typeof google !== 'undefined' && google.script && google.script.run;
+
+      var els = {
+        apiUrl: document.getElementById('apiUrl'),
+        apiToken: document.getElementById('apiToken'),
+        settingsPanel: document.getElementById('settingsPanel'),
+        btnSettings: document.getElementById('btnSettings'),
+        btnCleanupUnread: document.getElementById('btnCleanupUnread'),
+        btnClassifyRead: document.getElementById('btnClassifyRead'),
+        btnArchive: document.getElementById('btnArchive'),
+        btnArchiveConfirm: document.getElementById('btnArchiveConfirm'),
+        btnArchiveCancel: document.getElementById('btnArchiveCancel'),
+        archiveConfirmPanel: document.getElementById('archiveConfirmPanel'),
+        btnDigest: document.getElementById('btnDigest'),
+        status: document.getElementById('status'),
+        output: document.getElementById('output'),
+        outputMeta: document.getElementById('outputMeta'),
+      };
+
+      function escapeHtml(str) {
+        return String(str)
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;');
+      }
+
+      function formatTime(iso) {
+        try {
+          return new Date(iso).toLocaleString(undefined, {
+            month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+          });
+        } catch (e) {
+          return iso;
+        }
+      }
+
+      function friendlyAction(action) {
+        var key = String(action).toLowerCase();
+        if (key === 'keep') return 'Kept in inbox';
+        if (key === 'delete' || key === 'cleanupqueue') return 'Queued for cleanup';
+        return action;
+      }
+
+      function friendlySource(source) {
+        var key = String(source).toLowerCase();
+        if (key === 'rule-based') return 'Rules';
+        if (key === 'gemini ai') return 'AI';
+        return source;
+      }
+
+      function friendlyReason(reason) {
+        if (!reason) return '';
+        if (reason === 'Matched Rule') return 'Matched your rules';
+        return reason;
+      }
+
+      function actionBadgeClass(action) {
+        var lower = String(action).toLowerCase();
+        if (lower === 'keep') return 'badge-keep';
+        if (lower === 'delete' || lower === 'cleanupqueue') return 'badge-delete';
+        return 'badge-label';
+      }
+
+      function buildSummaryTable(title, items, labelFn) {
+        if (!items || !items.length) return '';
+        var mapLabel = labelFn || function (x) { return x; };
+        var rows = items.map(function (item) {
+          return '<tr><td>' + escapeHtml(mapLabel(item.label)) + '</td><td>' + item.count + '</td></tr>';
+        }).join('');
+        return (
+          '<div class="summary-card"><h4>' + escapeHtml(title) + '</h4>' +
+          '<table><tbody>' + rows + '</tbody></table></div>'
+        );
+      }
+
+      function aggregateSummary(items, labelFn) {
+        var counts = {};
+        (items || []).forEach(function (item) {
+          var key = labelFn(item.label);
+          counts[key] = (counts[key] || 0) + item.count;
+        });
+        return Object.keys(counts).sort().map(function (key) {
+          return { label: key, count: counts[key] };
+        });
+      }
+
+      function digestPeriodSubtitle(digest) {
+        var label = digest.periodLabel || 'since last cleanup run';
+        var parts = [label, digest.totalCount + ' email' + (digest.totalCount === 1 ? '' : 's')];
+        if (digest.since) {
+          parts.unshift('From ' + formatTime(digest.since));
+        }
+        return parts.join(' · ');
+      }
+
+      function renderDigestTable(digest, bannerMessage) {
+        els.output.classList.remove('empty');
+
+        if (!digest || digest.empty) {
+          els.output.innerHTML = '<div class="message-box">' + escapeHtml(digest.message || bannerMessage || 'No data.') + '</div>';
+          return;
+        }
+
+        var bannerHtml = bannerMessage
+          ? '<div class="message-box digest-banner">' + escapeHtml(bannerMessage) + '</div>'
+          : '';
+
+        var summaryHtml =
+          '<div class="summary-grid">' +
+          buildSummaryTable('By action', aggregateSummary(digest.byAction, friendlyAction)) +
+          buildSummaryTable('By source', aggregateSummary(digest.bySource, friendlySource)) +
+          '</div>';
+
+        var bodyRows = digest.rows.map(function (row) {
+          return (
+            '<tr>' +
+            '<td class="col-time">' + escapeHtml(formatTime(row.timestamp)) + '</td>' +
+            '<td><span class="badge ' + actionBadgeClass(row.action) + '">' + escapeHtml(friendlyAction(row.action)) + '</span></td>' +
+            '<td class="col-subject">' + escapeHtml(row.subject) + '</td>' +
+            '<td class="col-sender">' + escapeHtml(row.sender) + '</td>' +
+            '<td class="col-reason">' + escapeHtml(friendlyReason(row.reason)) + '</td>' +
+            '</tr>'
+          );
+        }).join('');
+
+        els.output.innerHTML =
+          bannerHtml +
+          '<div class="digest-wrap">' +
+          '<div class="digest-head">' +
+          '<h3>What changed</h3>' +
+          '<span>' + escapeHtml(digestPeriodSubtitle(digest)) + '</span>' +
+          '</div>' +
+          summaryHtml +
+          '<div class="table-scroll">' +
+          '<table class="digest-table">' +
+          '<thead><tr>' +
+          '<th>Time</th><th>Action</th><th>Subject</th><th>Sender</th><th>Reason</th>' +
+          '</tr></thead>' +
+          '<tbody>' + bodyRows + '</tbody>' +
+          '</table></div></div>';
+
+        els.output.scrollTop = 0;
+      }
+
+      function renderMessage(text) {
+        els.output.classList.remove('empty');
+        els.output.innerHTML = '<div class="message-box">' + escapeHtml(text) + '</div>';
+      }
+
+      function showSettingsPanel(show) {
+        if (useServerBridge) return;
+        els.settingsPanel.classList.toggle('hidden', !show);
+        els.btnSettings.hidden = !localStorage.getItem(STORAGE_TOKEN);
+        if (show) els.settingsPanel.open = true;
+      }
+
+      function loadSettings() {
+        if (useServerBridge) {
+          els.settingsPanel.classList.add('hidden');
+          els.btnSettings.hidden = true;
+          return;
+        }
+
+        var serverUrl = (typeof SERVER_WEB_APP_URL === 'string' && SERVER_WEB_APP_URL.indexOf('http') === 0)
+          ? SERVER_WEB_APP_URL : '';
+        els.apiUrl.value = localStorage.getItem(STORAGE_URL) || serverUrl;
+        els.apiToken.value = localStorage.getItem(STORAGE_TOKEN) || '';
+        showSettingsPanel(!localStorage.getItem(STORAGE_TOKEN));
+      }
+
+      function saveSettings() {
+        if (useServerBridge) return;
+        localStorage.setItem(STORAGE_URL, els.apiUrl.value.trim());
+        localStorage.setItem(STORAGE_TOKEN, els.apiToken.value);
+        if (els.apiToken.value) showSettingsPanel(false);
+      }
+
+      els.apiUrl.addEventListener('change', saveSettings);
+      els.apiToken.addEventListener('change', saveSettings);
+      els.btnSettings.addEventListener('click', function () { showSettingsPanel(true); });
+
+      function setGlobalBusy(activeButton, isBusy) {
+        els.btnCleanupUnread.disabled = isBusy;
+        els.btnClassifyRead.disabled = isBusy;
+        els.btnArchive.disabled = isBusy;
+        els.btnDigest.disabled = isBusy;
+        [els.btnCleanupUnread, els.btnClassifyRead, els.btnArchive, els.btnDigest].forEach(function (btn) {
+          btn.classList.toggle('is-loading', isBusy && btn === activeButton);
+          btn.setAttribute('aria-busy', isBusy && btn === activeButton ? 'true' : 'false');
+        });
+      }
+
+      function setStatus(message, type) {
+        els.status.textContent = message || '';
+        els.status.className = 'status' + (type ? ' ' + type : '');
+      }
+
+      function callServer(fnName, args) {
+        return new Promise(function (resolve, reject) {
+          var runner = google.script.run
+            .withSuccessHandler(resolve)
+            .withFailureHandler(reject);
+          runner[fnName].apply(runner, args || []);
+        });
+      }
+
+      async function postToWebApp(action, options) {
+        options = options || {};
+        var url = els.apiUrl.value.trim();
+        var token = els.apiToken.value;
+        if (!url) throw new Error('Enter your Web App URL in Connection settings.');
+        if (!token) throw new Error('Enter your API token in Connection settings.');
+
+        var body = { action: action, token: token };
+
+        var response = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+          redirect: 'follow',
+        });
+
+        var data = JSON.parse(await response.text());
+        if (!data.ok) throw new Error(data.error || 'Request failed.');
+        return data;
+      }
+
+      async function invokeCleanupUnread() {
+        setGlobalBusy(els.btnCleanupUnread, true);
+        setStatus('Cleaning up unread mail…', '');
+
+        try {
+          var data = useServerBridge
+            ? await callServer('dashboardRunUnreadCleanup')
+            : await postToWebApp('cleanup');
+          renderDigestTable(data.digest, data.message);
+          els.outputMeta.textContent = new Date().toLocaleString();
+          setStatus('Unread cleanup complete.', 'success');
+        } catch (err) {
+          setStatus(err.message || String(err), 'error');
+          renderMessage('Error: ' + (err.message || String(err)));
+        } finally {
+          setGlobalBusy(null, false);
+        }
+      }
+
+      async function invokeClassifyRead() {
+        setGlobalBusy(els.btnClassifyRead, true);
+        setStatus('Classifying read mail…', '');
+
+        try {
+          var data = useServerBridge
+            ? await callServer('dashboardClassifyRead')
+            : await postToWebApp('classifyRead');
+          renderDigestTable(data.digest, data.message);
+          els.outputMeta.textContent = new Date().toLocaleString();
+          setStatus('Read classification complete.', 'success');
+        } catch (err) {
+          setStatus(err.message || String(err), 'error');
+          renderMessage('Error: ' + (err.message || String(err)));
+        } finally {
+          setGlobalBusy(null, false);
+        }
+      }
+
+      function showArchiveConfirm(show) {
+        els.archiveConfirmPanel.classList.toggle('hidden', !show);
+      }
+
+      function invokeArchive() {
+        showArchiveConfirm(true);
+        els.btnArchiveConfirm.focus();
+      }
+
+      async function executeArchive() {
+        showArchiveConfirm(false);
+        setGlobalBusy(els.btnArchive, true);
+        setStatus('Archiving reviewed items…', '');
+
+        try {
+          var data = useServerBridge
+            ? await callServer('dashboardArchiveReviewed')
+            : await postToWebApp('archiveReviewed');
+          renderMessage(data.message || 'Archive complete.');
+          els.outputMeta.textContent = new Date().toLocaleString();
+          setStatus('Archive complete.', 'success');
+        } catch (err) {
+          setStatus(err.message || String(err), 'error');
+          renderMessage('Error: ' + (err.message || String(err)));
+        } finally {
+          setGlobalBusy(null, false);
+        }
+      }
+
+      async function invokeDigest() {
+        setGlobalBusy(els.btnDigest, true);
+        setStatus('Loading digest…', '');
+
+        try {
+          var data = useServerBridge
+            ? await callServer('dashboardFetchDigest')
+            : await postToWebApp('digest');
+          renderDigestTable(data.digest || { empty: true, message: data.content || 'No digest data.' });
+          els.outputMeta.textContent = 'Updated ' + new Date().toLocaleString();
+          setStatus('Digest loaded.', 'success');
+        } catch (err) {
+          setStatus(err.message || String(err), 'error');
+          renderMessage('Error: ' + (err.message || String(err)));
+        } finally {
+          setGlobalBusy(null, false);
+        }
+      }
+
+      els.btnCleanupUnread.addEventListener('click', invokeCleanupUnread);
+      els.btnClassifyRead.addEventListener('click', invokeClassifyRead);
+      els.btnArchive.addEventListener('click', invokeArchive);
+      els.btnArchiveConfirm.addEventListener('click', executeArchive);
+      els.btnArchiveCancel.addEventListener('click', function () { showArchiveConfirm(false); });
+      els.btnDigest.addEventListener('click', invokeDigest);
+      loadSettings();
+    })();
+  </script>
+</body>
+</html>

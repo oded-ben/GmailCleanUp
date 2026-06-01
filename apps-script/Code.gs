@@ -7,12 +7,14 @@
 //   GEMINI_API_KEY              — https://aistudio.google.com/apikey
 //   GEMINI_MODEL                — optional, default gemini-2.5-flash
 //   DASHBOARD_SPREADSHEET_ID    — optional; auto-created on first log if unset
+//   WEBAPP_API_SECRET           — required for Web App API (doPost); use a long random string
 
 const LABEL_NAME = 'CleanupQueue';
 const SPECIAL_KEEP = 'Keep';
 const SPECIAL_DELETE = 'Delete';
 const BATCH_SIZE = 200;
 const AI_BATCH_SIZE = 50;
+const READ_EMAILS_SEARCH_QUERY = 'is:read in:inbox -label:CleanupQueue';
 const AI_SNIPPET_CHARS = 800;
 const DEFAULT_GEMINI_MODEL = 'gemini-2.5-flash';
 const MAX_SCHEMA_ENUM_LABELS = 128;
@@ -22,6 +24,7 @@ const MAX_SCHEMA_ENUM_LABELS = 128;
 const DASHBOARD_LOG_SHEET = 'Classification Log';
 const DASHBOARD_SPREADSHEET_TITLE = 'Gmail Cleanup Dashboard';
 const DASHBOARD_HEADERS = ['Timestamp', 'Source', 'Sender', 'Subject', 'Action', 'Reason'];
+const LAST_CLEANUP_RUN_KEY = 'LAST_CLEANUP_RUN_AT';
 
 /**
  * Resolves the log spreadsheet: Script property → bound sheet → auto-create.
@@ -509,7 +512,26 @@ function resetLabel() {
   }
 }
 
-function classifyInbox() {
+function buildInboxSearchQuery_(includeRead) {
+  var query = 'in:inbox -label:CleanupQueue';
+  if (!includeRead) {
+    query = 'is:unread ' + query;
+  }
+  return query;
+}
+
+function buildReviewedArchiveQuery_() {
+  return 'label:' + LABEL_NAME + ' in:inbox';
+}
+
+function applyCleanupQueueAction_(thread, label, wasUnread) {
+  thread.addLabel(label);
+  if (wasUnread) {
+    thread.moveToArchive();
+  }
+}
+
+function classifyInbox(includeRead) {
   var logEntries = [];
   var label = GmailApp.getUserLabelByName(LABEL_NAME);
   if (!label) {
@@ -517,10 +539,11 @@ function classifyInbox() {
     return;
   }
 
-  var threads = GmailApp.search('is:unread in:inbox -label:CleanupQueue', 0, BATCH_SIZE);
+  var threads = GmailApp.search(buildInboxSearchQuery_(includeRead), 0, BATCH_SIZE);
   var tagged = 0, kept = 0, unclassified = 0;
 
   threads.forEach(function(thread) {
+    var wasUnread = thread.isUnread();
     var msg = thread.getMessages()[0];
     var sender = msg.getFrom();
     var subject = msg.getSubject();
@@ -533,10 +556,9 @@ function classifyInbox() {
     }
 
     if (verdict === 'delete') {
-      thread.addLabel(label);
-      thread.moveToArchive();
+      applyCleanupQueueAction_(thread, label, wasUnread);
       logEntries.push([new Date(), 'Rule-Based', sender, subject, LABEL_NAME, 'Matched Rule']);
-      Logger.log('-> CleanupQueue: ' + subject);
+      Logger.log('-> CleanupQueue' + (wasUnread ? ' (archived)' : ' (left in inbox)') + ': ' + subject);
       tagged++;
     } else {
       Logger.log('? Unclassified: ' + subject + ' | ' + sender);
@@ -555,7 +577,7 @@ function classifyInbox() {
 
 // --- Pass 2: AI multi-label classification (Gemini) ---
 
-function classifyUnclassified() {
+function classifyUnclassified(includeRead) {
   var logEntries = [];
   var cleanupLabel = GmailApp.getUserLabelByName(LABEL_NAME);
   if (!cleanupLabel) {
@@ -574,9 +596,9 @@ function classifyUnclassified() {
   Logger.log('User labels for AI (' + existingLabels.length + '): ' +
     (existingLabels.length ? existingLabels.join(', ') : '(none)'));
 
-  var threads = GmailApp.search('is:unread in:inbox -label:CleanupQueue', 0, AI_BATCH_SIZE);
+  var threads = GmailApp.search(buildInboxSearchQuery_(includeRead), 0, AI_BATCH_SIZE);
   if (threads.length === 0) {
-    Logger.log('No unclassified emails remaining!');
+    Logger.log('No emails remaining' + (includeRead ? '' : ' (unread only)') + '!');
     logToDashboard(logEntries);
     return;
   }
@@ -614,6 +636,7 @@ function classifyUnclassified() {
     var thread = threads[d.index - 1];
     if (!thread) return;
 
+    var wasUnread = thread.isUnread();
     var msg = thread.getMessages()[0];
     var sender = msg.getFrom();
     var subject = msg.getSubject();
@@ -625,9 +648,9 @@ function classifyUnclassified() {
     logEntries.push([new Date(), 'Gemini AI', sender, subject, decision, reason]);
 
     if (resolved === SPECIAL_DELETE) {
-      thread.addLabel(cleanupLabel);
-      thread.moveToArchive();
-      Logger.log('-> ' + LABEL_NAME + ' [Delete]: ' + subject + ' — ' + reason);
+      applyCleanupQueueAction_(thread, cleanupLabel, wasUnread);
+      Logger.log('-> ' + LABEL_NAME + ' [Delete' + (wasUnread ? ', archived' : ', left in inbox') + ']: ' +
+        subject + ' — ' + reason);
       deleted++;
       return;
     }
@@ -661,6 +684,156 @@ function classifyUnclassified() {
   Logger.log('Model      : ' + getGeminiModel());
 }
 
+/**
+ * Read-only inbox classification: rules then AI on read mail only.
+ * Query is fixed to is:read in:inbox -label:CleanupQueue — never touches unread mail.
+ * Labels only; never archives (threads stay in inbox for review).
+ */
+function classifyReadEmails() {
+  setupLabel();
+
+  var cleanupLabel = GmailApp.getUserLabelByName(LABEL_NAME);
+  if (!cleanupLabel) {
+    Logger.log('Run setupLabel() first!');
+    return;
+  }
+
+  markCleanupRunStart_();
+
+  // --- Pass 1: rule-based (read inbox only) ---
+  var logEntries = [];
+  var tagged = 0, kept = 0, unclassified = 0;
+  var ruleThreads = GmailApp.search(READ_EMAILS_SEARCH_QUERY, 0, BATCH_SIZE);
+
+  ruleThreads.forEach(function(thread) {
+    var msg = thread.getMessages()[0];
+    var sender = msg.getFrom();
+    var subject = msg.getSubject();
+    var verdict = classifyByRules(sender, subject);
+
+    if (verdict === 'keep') {
+      logEntries.push([new Date(), 'Rule-Based', sender, subject, 'Keep', 'Matched Rule']);
+      kept++;
+      return;
+    }
+
+    if (verdict === 'delete') {
+      thread.addLabel(cleanupLabel);
+      logEntries.push([new Date(), 'Rule-Based', sender, subject, LABEL_NAME, 'Matched Rule']);
+      Logger.log('-> CleanupQueue [read, inbox]: ' + subject);
+      tagged++;
+      return;
+    }
+
+    Logger.log('? Unclassified [read]: ' + subject + ' | ' + sender);
+    unclassified++;
+  });
+
+  logToDashboard(logEntries);
+
+  Logger.log('--- Read Mail Rule Pass ---');
+  Logger.log('Tagged    : ' + tagged);
+  Logger.log('Kept      : ' + kept);
+  Logger.log('Unclear   : ' + unclassified);
+  Logger.log('Total     : ' + ruleThreads.length);
+
+  // --- Pass 2: AI multi-label (read inbox only) ---
+  if (!getGeminiApiKey()) {
+    Logger.log('Skipping AI pass — add GEMINI_API_KEY to Script Properties.');
+    return;
+  }
+
+  var aiLogEntries = [];
+  var existingLabels = getExistingLabels();
+  var labelLookup = buildLabelLookup(existingLabels);
+
+  Logger.log('User labels for AI (' + existingLabels.length + '): ' +
+    (existingLabels.length ? existingLabels.join(', ') : '(none)'));
+
+  var aiThreads = GmailApp.search(READ_EMAILS_SEARCH_QUERY, 0, AI_BATCH_SIZE);
+  if (aiThreads.length === 0) {
+    Logger.log('No read emails remaining for AI pass.');
+    logToDashboard(aiLogEntries);
+    return;
+  }
+
+  var items = aiThreads.map(function(thread, i) {
+    var msg = thread.getMessages()[0];
+    return (i + 1) + '. From: ' + msg.getFrom() +
+      ' | Subject: ' + msg.getSubject() +
+      ' | Snippet: ' + (msg.getPlainBody() || '').slice(0, AI_SNIPPET_CHARS);
+  });
+
+  var rawText;
+  try {
+    rawText = callGemini('Emails to classify:\n' + items.join('\n'), existingLabels);
+  } catch (err) {
+    Logger.log('ERROR: ' + err.message);
+    return;
+  }
+
+  Logger.log('Gemini raw response: ' + rawText);
+
+  var suggestions;
+  try {
+    suggestions = parseLabelSuggestionsFromAi(rawText);
+  } catch (err) {
+    Logger.log('ERROR: ' + err.message);
+    return;
+  }
+
+  var labeled = 0, deleted = 0, keptAi = 0, skipped = 0;
+
+  suggestions.forEach(function(d) {
+    var thread = aiThreads[d.index - 1];
+    if (!thread) return;
+
+    var msg = thread.getMessages()[0];
+    var sender = msg.getFrom();
+    var subject = msg.getSubject();
+    var rawLabel = d.suggestedLabel !== undefined ? d.suggestedLabel : d.decision;
+    var decision = d.decision !== undefined ? d.decision : rawLabel;
+    var resolved = resolveSuggestedLabel(rawLabel, existingLabels);
+    var reason = d.reason || '';
+
+    aiLogEntries.push([new Date(), 'Gemini AI', sender, subject, decision, reason]);
+
+    if (resolved === SPECIAL_DELETE) {
+      thread.addLabel(cleanupLabel);
+      Logger.log('-> ' + LABEL_NAME + ' [read, inbox]: ' + subject + ' — ' + reason);
+      deleted++;
+      return;
+    }
+
+    if (resolved === SPECIAL_KEEP) {
+      Logger.log('Keep [read, AI]: ' + subject + ' — ' + reason);
+      keptAi++;
+      return;
+    }
+
+    var entry = labelLookup[resolved.toLowerCase()];
+    if (entry) {
+      thread.addLabel(entry.label);
+      Logger.log('-> Label "' + entry.name + '" [read]: ' + subject + ' — ' + reason);
+      labeled++;
+      return;
+    }
+
+    Logger.log('? Unknown label "' + rawLabel + '", left in inbox: ' + subject);
+    skipped++;
+  });
+
+  logToDashboard(aiLogEntries);
+
+  Logger.log('--- Read Mail AI Pass ---');
+  Logger.log('Labeled    : ' + labeled);
+  Logger.log('Deleted    : ' + deleted);
+  Logger.log('Kept       : ' + keptAi);
+  Logger.log('Unrecognized: ' + skipped);
+  Logger.log('Total      : ' + aiThreads.length);
+  Logger.log('Model      : ' + getGeminiModel());
+}
+
 /** Log all custom labels available to the classifier. */
 function listExistingLabels() {
   var labels = getExistingLabels();
@@ -668,10 +841,78 @@ function listExistingLabels() {
   labels.forEach(function(name) { Logger.log('  - ' + name); });
 }
 
-function runFullCleanup() {
+function runFullCleanup(includeRead) {
+  markCleanupRunStart_();
   setupLabel();
-  classifyInbox();
-  classifyUnclassified();
+  classifyInbox(includeRead);
+  classifyUnclassified(includeRead);
+}
+
+/**
+ * Archives inbox threads tagged CleanupQueue (read and unread) after review.
+ * @returns {{archived: number, message: string}}
+ */
+function archiveReviewedCleanupItems() {
+  var query = buildReviewedArchiveQuery_();
+  var archived = 0;
+  var batchSize = 100;
+
+  while (true) {
+    var threads = GmailApp.search(query, 0, batchSize);
+    if (!threads.length) {
+      break;
+    }
+
+    threads.forEach(function(thread) {
+      thread.moveToArchive();
+      archived++;
+    });
+
+    if (threads.length < batchSize) {
+      break;
+    }
+  }
+
+  Logger.log('Archived reviewed CleanupQueue threads: ' + archived);
+  return {
+    archived: archived,
+    message: buildArchiveReviewedMessage_(archived),
+  };
+}
+
+/** @deprecated Use archiveReviewedCleanupItems */
+function archiveReviewedReadCleanupItems() {
+  return archiveReviewedCleanupItems();
+}
+
+function buildArchiveReviewedMessage_(archived) {
+  if (!archived) {
+    return 'No CleanupQueue emails found in your inbox to archive.';
+  }
+  return 'Archived ' + archived + ' reviewed email' + (archived === 1 ? '' : 's') +
+    ' from your inbox.';
+}
+
+function markCleanupRunStart_() {
+  PropertiesService.getScriptProperties().setProperty(
+    LAST_CLEANUP_RUN_KEY,
+    new Date().toISOString()
+  );
+}
+
+function getLastCleanupRunAt_() {
+  var raw = PropertiesService.getScriptProperties().getProperty(LAST_CLEANUP_RUN_KEY);
+  if (!raw) return null;
+  var dt = new Date(raw);
+  return isNaN(dt.getTime()) ? null : dt;
+}
+
+function buildCleanupCompleteMessage_(digest) {
+  if (!digest || digest.empty || digest.totalCount === 0) {
+    return 'All done. No emails needed processing this time.';
+  }
+  var n = digest.totalCount;
+  return 'All done. Processed ' + n + ' email' + (n === 1 ? '' : 's') + ' — see the table below for details.';
 }
 
 /** Run once to verify GEMINI_API_KEY works. */
@@ -705,4 +946,331 @@ function testLogToDashboard() {
 /** Sheet only — ensure dashboard exists; no Gmail, no logging. */
 function runSetupDashboardOnly() {
   setupDashboard();
+}
+
+// --- Web App API ---
+
+function getWebAppApiSecret() {
+  return PropertiesService.getScriptProperties().getProperty('WEBAPP_API_SECRET');
+}
+
+function parseWebAppPayload_(e) {
+  if (!e || !e.postData || !e.postData.contents) {
+    throw new Error('Missing JSON body. POST application/json with { "action": "...", "token": "..." }.');
+  }
+  try {
+    return JSON.parse(e.postData.contents);
+  } catch (err) {
+    throw new Error('Invalid JSON payload.');
+  }
+}
+
+function isAuthorizedWebAppRequest_(payload, e) {
+  var secret = getWebAppApiSecret();
+  if (!secret) {
+    throw new Error('WEBAPP_API_SECRET is not set in Script Properties.');
+  }
+  var provided = (payload && payload.token) || (e && e.parameter && e.parameter.token) || '';
+  return String(provided) === String(secret);
+}
+
+function jsonResponse_(body) {
+  return ContentService
+    .createTextOutput(JSON.stringify(body))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+/**
+ * Builds structured digest data from the dashboard log since the last cleanup run.
+ * @returns {Object}
+ */
+function buildDashboardDigestData_() {
+  var emptyResult = function(message, periodLabel) {
+    return {
+      empty: true,
+      message: message,
+      periodLabel: periodLabel || 'since last cleanup run',
+      periodHours: null,
+      since: null,
+      totalCount: 0,
+      rows: [],
+      byAction: [],
+      bySource: [],
+    };
+  };
+
+  var lastRunAt = getLastCleanupRunAt_();
+  if (!lastRunAt) {
+    return emptyResult(
+      'Run inbox cleanup first, then come back here to see what changed.',
+      'since last cleanup run'
+    );
+  }
+
+  var ss;
+  try {
+    ss = ensureDashboardSpreadsheet();
+  } catch (e) {
+    return emptyResult('Could not open the log spreadsheet. ' + e.message, 'since last cleanup run');
+  }
+
+  var sheet = ss.getSheetByName(DASHBOARD_LOG_SHEET);
+  if (!sheet || sheet.getLastRow() <= 1) {
+    return emptyResult(
+      'No activity was logged during the last cleanup run.',
+      'since last cleanup run'
+    );
+  }
+
+  var numRows = sheet.getLastRow() - 1;
+  var rawRows = sheet.getRange(2, 1, numRows, DASHBOARD_HEADERS.length).getValues();
+  var cutoff = lastRunAt;
+  var actionCounts = {};
+  var sourceCounts = {};
+  var entries = [];
+
+  for (var i = rawRows.length - 1; i >= 0; i--) {
+    var row = rawRows[i];
+    var ts = row[0];
+    if (!(ts instanceof Date)) {
+      ts = new Date(ts);
+    }
+    if (isNaN(ts.getTime()) || ts < cutoff) {
+      continue;
+    }
+
+    var source = String(row[1] || 'Unknown');
+    var sender = String(row[2] || '');
+    var subject = String(row[3] || '(no subject)');
+    var action = String(row[4] || 'Unknown');
+    var reason = String(row[5] || '');
+
+    sourceCounts[source] = (sourceCounts[source] || 0) + 1;
+    actionCounts[action] = (actionCounts[action] || 0) + 1;
+
+    entries.push({
+      timestamp: ts.toISOString(),
+      source: source,
+      sender: sender,
+      subject: subject,
+      action: action,
+      reason: reason,
+    });
+  }
+
+  if (!entries.length) {
+    return emptyResult(
+      'Nothing was processed during the last cleanup run.',
+      'since last cleanup run'
+    );
+  }
+
+  function toSummary(counts) {
+    return Object.keys(counts).sort().map(function(key) {
+      return { label: key, count: counts[key] };
+    });
+  }
+
+  return {
+    empty: false,
+    message: '',
+    periodLabel: 'since last cleanup run',
+    periodHours: null,
+    since: lastRunAt.toISOString(),
+    totalCount: entries.length,
+    rows: entries,
+    byAction: toSummary(actionCounts),
+    bySource: toSummary(sourceCounts),
+  };
+}
+
+function formatDigestAsText_(digest) {
+  if (digest.empty) {
+    return digest.message;
+  }
+
+  var lines = [
+    'Gmail Cleanup digest (' + digest.periodLabel + ')',
+    'Total actions: ' + digest.totalCount,
+    '',
+    'By action:',
+  ];
+
+  digest.byAction.forEach(function(item) {
+    lines.push('  • ' + item.label + ': ' + item.count);
+  });
+
+  lines.push('', 'By source:');
+  digest.bySource.forEach(function(item) {
+    lines.push('  • ' + item.label + ': ' + item.count);
+  });
+
+  return lines.join('\n');
+}
+
+/**
+ * Summarizes recent dashboard log activity (last 24 hours).
+ * @returns {string}
+ */
+function generateDashboardActionDigest() {
+  return formatDigestAsText_(buildDashboardDigestData_());
+}
+
+/**
+ * Web App entry point (POST only).
+ * Body: { "action": "cleanup"|"digest"|"archiveReviewed"|"classifyRead", "token": "<WEBAPP_API_SECRET>", "includeRead": false }
+ *
+ * Deploy: Deploy → New deployment → Web app
+ *   Execute as: Me
+ *   Who has access: Anyone (token still required)
+ */
+function doPost(e) {
+  try {
+    var payload = parseWebAppPayload_(e);
+
+    if (!isAuthorizedWebAppRequest_(payload, e)) {
+      return jsonResponse_({ ok: false, error: 'Unauthorized' });
+    }
+
+    var action = String(payload.action || '').toLowerCase();
+
+    if (action === 'cleanup') {
+      var includeRead = payload.includeRead === true ||
+        String(payload.includeRead || '').toLowerCase() === 'true';
+      runFullCleanup(includeRead);
+      var cleanupDigest = buildDashboardDigestData_();
+      return jsonResponse_({
+        ok: true,
+        action: 'cleanup',
+        message: buildCleanupCompleteMessage_(cleanupDigest),
+        digest: cleanupDigest,
+      });
+    }
+
+    if (action === 'digest') {
+      var digest = buildDashboardDigestData_();
+      return jsonResponse_({
+        ok: true,
+        action: 'digest',
+        content: formatDigestAsText_(digest),
+        digest: digest,
+      });
+    }
+
+    if (action === 'archivereviewed') {
+      var archiveResult = archiveReviewedCleanupItems();
+      return jsonResponse_({
+        ok: true,
+        action: 'archiveReviewed',
+        message: archiveResult.message,
+        archived: archiveResult.archived,
+      });
+    }
+
+    if (action === 'classifyread') {
+      classifyReadEmails();
+      var readDigest = buildDashboardDigestData_();
+      return jsonResponse_({
+        ok: true,
+        action: 'classifyRead',
+        message: buildCleanupCompleteMessage_(readDigest),
+        digest: readDigest,
+      });
+    }
+
+    return jsonResponse_({
+      ok: false,
+      error: 'Unknown action. Use "cleanup", "digest", "archiveReviewed", or "classifyRead".',
+    });
+  } catch (err) {
+    Logger.log('doPost error: ' + err.message);
+    return jsonResponse_({ ok: false, error: err.message });
+  }
+}
+
+/** Generate a random API secret — run once, copy output to WEBAPP_API_SECRET. */
+function generateWebAppApiSecret() {
+  var token = Utilities.getUuid() + Utilities.getUuid();
+  Logger.log('Add to Script Properties as WEBAPP_API_SECRET:');
+  Logger.log(token);
+  return token;
+}
+
+// --- Dashboard UI (HtmlService) ---
+
+/**
+ * Serves the HTML dashboard. Deploy as Web app; open the deployment URL in a browser.
+ * GET shows the UI; POST (doPost) handles API calls.
+ */
+function doGet() {
+  var template = HtmlService.createTemplateFromFile('dashboard');
+  template.webAppUrl = ScriptApp.getService().getUrl();
+  return template.evaluate()
+    .setTitle('Gmail Cleanup')
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+/** Called from dashboard.html via google.script.run (token stays server-side). */
+function dashboardRunUnreadCleanup() {
+  runFullCleanup(false);
+  var digest = buildDashboardDigestData_();
+  return {
+    ok: true,
+    action: 'cleanup',
+    message: buildCleanupCompleteMessage_(digest),
+    digest: digest,
+  };
+}
+
+/** Called from dashboard.html via google.script.run (token stays server-side). */
+function dashboardClassifyRead() {
+  classifyReadEmails();
+  var digest = buildDashboardDigestData_();
+  return {
+    ok: true,
+    action: 'classifyRead',
+    message: buildCleanupCompleteMessage_(digest),
+    digest: digest,
+  };
+}
+
+/** Called from dashboard.html via google.script.run (token stays server-side). */
+function dashboardRunCleanup(includeRead) {
+  var includeReadEmails = includeRead === true ||
+    String(includeRead || '').toLowerCase() === 'true';
+  runFullCleanup(includeReadEmails);
+  var digest = buildDashboardDigestData_();
+  return {
+    ok: true,
+    message: buildCleanupCompleteMessage_(digest),
+    digest: digest,
+  };
+}
+
+/** Called from dashboard.html via google.script.run (token stays server-side). */
+function dashboardArchiveReviewed() {
+  var result = archiveReviewedCleanupItems();
+  return {
+    ok: true,
+    action: 'archiveReviewed',
+    message: result.message,
+    archived: result.archived,
+  };
+}
+
+/** Called from dashboard.html via google.script.run (token stays server-side). */
+function dashboardArchiveReviewedReadItems() {
+  return dashboardArchiveReviewed();
+}
+
+/** Called from dashboard.html via google.script.run (token stays server-side). */
+function dashboardFetchDigest() {
+  var digest = buildDashboardDigestData_();
+  return {
+    ok: true,
+    action: 'digest',
+    content: formatDigestAsText_(digest),
+    digest: digest,
+  };
 }
