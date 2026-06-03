@@ -172,8 +172,17 @@ function senderMatches(fromLower, email, exactSet, listDesc) {
   return false;
 }
 
+function getGmailCategoryNames(labelIds) {
+  const names = [];
+  for (const id of labelIds || []) {
+    if (id === 'CATEGORY_PROMOTIONS') names.push('promotions');
+    if (id === 'CATEGORY_SOCIAL') names.push('social');
+  }
+  return names;
+}
+
 function ruleClassify(thread) {
-  const { from = '', subject = '' } = thread;
+  const { from = '', subject = '', listUnsubscribe, labelIds = [] } = thread;
   const fromLower = from.toLowerCase();
   const email = extractEmailAddress(from);
   const domain = extractDomain(from);
@@ -185,6 +194,20 @@ function ruleClassify(thread) {
   if (domainMatchesIndex(domain, KEEP_DOMAIN_INDEX)) {
     return { decision: 'keep', reason: `known keep domain: ${domain}`, method: 'rule' };
   }
+
+  if (listUnsubscribe) {
+    return { decision: 'delete', reason: 'List-Unsubscribe header', method: 'rule' };
+  }
+
+  const categories = getGmailCategoryNames(labelIds);
+  if (categories.length) {
+    return {
+      decision: 'delete',
+      reason: `Gmail category: ${categories.join(', ')}`,
+      method: 'rule',
+    };
+  }
+
   if (senderMatches(fromLower, email, DELETE_SENDERS_SET, DELETE_SENDERS_DESC)) {
     return { decision: 'delete', reason: 'matched delete sender', method: 'rule' };
   }
@@ -204,21 +227,35 @@ function ruleClassify(thread) {
 
 const { GoogleGenAI } = require('@google/genai');
 
-const SYSTEM_PROMPT = `You are an email triage assistant. Classify mail for someone running a startup, doing software development, and managing personal life.
+const SYSTEM_PROMPT = `You are an email triage assistant. You receive batches of messages with metadata and body snippets.
 
-Keep emails that are: from real people; startup operations (customers, partners, hiring, finance, legal); software/dev work (code, CI/CD, cloud, APIs, vendors, security); personal life (family, health, home, travel, accounts); receipts and transactional mail that may be needed later.
+Analyze each batch on its own: infer who sends bulk mail, which items are newsletters or marketing, which are direct personal or operational mail, and which automated notices look actionable.
 
-Delete emails that are: marketing, newsletters, promotions, retail deals, product updates, drip campaigns, event invites from brands, LinkedIn/social digests, SaaS nurture mail, job-alert spam, and automated notifications that are not actionable. Be aggressive with bulk and promotional mail.
+Do not assume any fixed job, industry, or inbox profile — reason only from batch evidence.
 
-When uncertain, prefer keep only if the message looks personally or operationally important.
+Keep emails that appear individually important: direct human correspondence, actionable requests, reservations or receipts you may need, security or account alerts, time-sensitive coordination.
+
+Delete emails that are junk or low-value bulk: promotional blasts, newsletters, drip campaigns, marketing automation, social or network digests, retailer deals, product-update spam, and non-actionable bulk notifications. Be decisive when metadata or copy signals mass mail (List-Unsubscribe, List-Id, marketing footers, percent-off language, etc.).
+
+When uncertain, prefer keep only if importance is clear from the content.
 
 Respond with ONLY a JSON array — no markdown, no explanation outside the JSON:
 [{"index": 1, "decision": "keep", "reason": "one short phrase"}, ...]`;
 
 function formatEmailBatch(threads) {
-  return threads.map((t, i) =>
-    `${i + 1}. From: ${t.from || '(unknown)'} | Subject: ${t.subject || '(no subject)'} | Snippet: ${(t.snippet || '(empty)').slice(0, AI_SNIPPET_CHARS)}`
-  );
+  return threads.map((t, i) => {
+    const parts = [
+      `${i + 1}. From: ${t.from || '(unknown)'}`,
+      `Subject: ${t.subject || '(no subject)'}`,
+    ];
+    if (t.listUnsubscribe) parts.push('List-Unsubscribe: yes');
+    if (t.listId) parts.push('List-Id: present');
+    if (t.precedence) parts.push(`Precedence: ${t.precedence}`);
+    const categories = getGmailCategoryNames(t.labelIds);
+    if (categories.length) parts.push(`Gmail categories: ${categories.join(', ')}`);
+    parts.push(`Snippet: ${(t.snippet || '(empty)').slice(0, AI_SNIPPET_CHARS)}`);
+    return parts.join(' | ');
+  });
 }
 
 function parseAiDecisions(raw) {

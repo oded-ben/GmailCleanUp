@@ -31,7 +31,7 @@ async function getThreadInfo(gmail, threadId) {
     userId: 'me',
     id: threadId,
     format: 'metadata',
-    metadataHeaders: ['From', 'Subject', 'Date'],
+    metadataHeaders: ['From', 'Subject', 'Date', 'List-Unsubscribe', 'List-Id', 'Precedence'],
   });
 
   const messages = res.data.messages || [];
@@ -40,6 +40,7 @@ async function getThreadInfo(gmail, threadId) {
   const msg = messages[0];
   const headers = msg.payload.headers || [];
   const get = name => (headers.find(h => h.name.toLowerCase() === name.toLowerCase()) || {}).value || '';
+  const listUnsubscribe = get('list-unsubscribe').trim();
 
   return {
     id: threadId,
@@ -48,6 +49,10 @@ async function getThreadInfo(gmail, threadId) {
     date: get('date'),
     snippet: (msg.snippet || '').slice(0, 800),
     messageCount: messages.length,
+    labelIds: res.data.labelIds || [],
+    listUnsubscribe: !!listUnsubscribe,
+    listId: get('list-id').trim(),
+    precedence: get('precedence').trim(),
   };
 }
 

@@ -376,6 +376,122 @@
       color: var(--text);
     }
 
+    .settings-grid select {
+      font-family: var(--font);
+      font-size: 0.875rem;
+      padding: 10px 12px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--surface);
+      color: var(--text);
+    }
+
+    .schedule-header {
+      margin-bottom: 14px;
+    }
+
+    .schedule-header h2 {
+      font-size: 0.8125rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+      margin-bottom: 4px;
+    }
+
+    .schedule-header p {
+      font-size: 0.8125rem;
+      color: var(--muted);
+    }
+
+    .schedule-actions {
+      margin-top: 14px;
+    }
+
+    .schedule-status {
+      margin-top: 12px;
+      font-size: 0.8125rem;
+      color: var(--muted);
+      min-height: 1.1rem;
+    }
+
+    .schedule-status.success { color: var(--accent); }
+
+    .schedule-days,
+    .schedule-task-types {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px 16px;
+      margin-top: 14px;
+      padding-top: 14px;
+      border-top: 1px solid var(--border);
+      border: none;
+    }
+
+    .schedule-days.hidden,
+    .schedule-time-row.hidden {
+      display: none;
+    }
+
+    .schedule-days legend,
+    .schedule-task-types legend {
+      width: 100%;
+      font-size: 0.75rem;
+      font-weight: 500;
+      color: var(--muted);
+      margin-bottom: 4px;
+    }
+
+    .schedule-day-option {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 0.8125rem;
+      cursor: pointer;
+      user-select: none;
+    }
+
+    .schedule-day-option input {
+      width: 15px;
+      height: 15px;
+      accent-color: var(--accent);
+      cursor: pointer;
+    }
+
+    .automation-banner {
+      margin-bottom: 20px;
+      padding: 16px 18px;
+      border: 1px solid #cfe0d9;
+      border-radius: var(--radius);
+      background: var(--accent-soft);
+      box-shadow: var(--shadow);
+    }
+
+    .automation-banner.inactive {
+      background: #fafaf8;
+      border-color: var(--border);
+    }
+
+    .automation-banner h2 {
+      font-size: 0.8125rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+
+    .automation-banner p {
+      font-size: 0.9375rem;
+      color: var(--text);
+      line-height: 1.45;
+    }
+
+    .automation-banner.active p {
+      color: var(--accent);
+      font-weight: 500;
+    }
+
     .hint { font-size: 0.75rem; color: var(--muted); margin-top: 8px; }
 
     button .btn-label { display: inline-flex; align-items: center; gap: 8px; }
@@ -410,6 +526,11 @@
 </head>
 <body>
   <div class="page">
+    <section class="automation-banner inactive" id="automationBanner" aria-live="polite">
+      <h2>Active Automation Schedule</h2>
+      <p id="automationBannerText">No automated schedule active.</p>
+    </section>
+
     <header>
       <div class="header-copy">
         <h1>Gmail Cleanup</h1>
@@ -462,14 +583,68 @@
       </div>
       <div class="confirm-panel hidden" id="archiveConfirmPanel" role="alertdialog" aria-labelledby="archiveConfirmTitle" aria-describedby="archiveConfirmDesc">
         <p id="archiveConfirmTitle"><strong>Are you sure?</strong></p>
-        <p id="archiveConfirmDesc">This will archive every CleanupQueue email still in your inbox (read and unread). You can restore them from Gmail’s All Mail if needed.</p>
+        <p id="archiveConfirmDesc">This will archive only emails the script labeled during your last run (Cleanup Read or Cleanup Unread) — even if you changed the label since. Keeps and manually labeled mail are not affected.</p>
         <div class="confirm-actions">
           <button type="button" class="btn-danger" id="btnArchiveConfirm">Yes, archive them</button>
           <button type="button" class="btn-secondary" id="btnArchiveCancel">Cancel</button>
         </div>
       </div>
-      <p class="option-hint">Unread mail is classified and archived automatically. Read mail is labeled only — use Archive when you are done reviewing.</p>
+      <p class="option-hint">Unread mail is classified and archived automatically. Read mail is labeled only — use Archive when you are done reviewing labeled items.</p>
       <p class="status" id="status" aria-live="polite"></p>
+    </section>
+
+    <section class="card">
+      <div class="schedule-header">
+        <h2>Automated Schedule</h2>
+        <p>Run a task automatically on a repeating timer (uses your script time zone for midnight).</p>
+      </div>
+      <div class="settings-grid">
+        <label>
+          Frequency
+          <select id="scheduleFrequency">
+            <option value="hourly">Hourly</option>
+            <option value="every6hours">Every 6 Hours</option>
+            <option value="weekly">Weekly</option>
+            <option value="custom">Custom Day</option>
+          </select>
+        </label>
+        <label class="schedule-time-row" id="scheduleTimeRow">
+          Time of day
+          <select id="scheduleTargetHour">
+            <option value="0">12:00 AM (Midnight)</option>
+            <option value="6">6:00 AM</option>
+            <option value="8">8:00 AM</option>
+            <option value="12">12:00 PM (Noon)</option>
+            <option value="18">6:00 PM</option>
+            <option value="21">9:00 PM</option>
+          </select>
+        </label>
+      </div>
+      <fieldset class="schedule-task-types" id="scheduleTaskTypesRow">
+        <legend>Task types</legend>
+        <label class="schedule-day-option"><input type="checkbox" id="taskUnread" value="unread" /> Classify Unread Only</label>
+        <label class="schedule-day-option"><input type="checkbox" id="taskRead" value="read" /> Classify Read Only</label>
+        <label class="schedule-day-option"><input type="checkbox" id="taskArchive" value="archive" /> Archive Reviewed Items</label>
+      </fieldset>
+      <fieldset class="schedule-days hidden" id="scheduleDaysRow">
+        <legend>Days of the week</legend>
+        <label class="schedule-day-option"><input type="checkbox" id="daySUNDAY" value="SUNDAY" /> Sun</label>
+        <label class="schedule-day-option"><input type="checkbox" id="dayMONDAY" value="MONDAY" /> Mon</label>
+        <label class="schedule-day-option"><input type="checkbox" id="dayTUESDAY" value="TUESDAY" /> Tue</label>
+        <label class="schedule-day-option"><input type="checkbox" id="dayWEDNESDAY" value="WEDNESDAY" /> Wed</label>
+        <label class="schedule-day-option"><input type="checkbox" id="dayTHURSDAY" value="THURSDAY" /> Thu</label>
+        <label class="schedule-day-option"><input type="checkbox" id="dayFRIDAY" value="FRIDAY" /> Fri</label>
+        <label class="schedule-day-option"><input type="checkbox" id="daySATURDAY" value="SATURDAY" /> Sat</label>
+      </fieldset>
+      <div class="schedule-actions">
+        <button type="button" class="btn-secondary" id="btnSaveSchedule">
+          <span class="btn-label">
+            <span class="spinner" aria-hidden="true"></span>
+            <span class="btn-text-default">Save Schedule</span>
+          </span>
+        </button>
+      </div>
+      <p class="schedule-status" id="scheduleStatus" aria-live="polite"></p>
     </section>
 
     <section class="card">
@@ -485,6 +660,7 @@
 
   <script>
     var SERVER_WEB_APP_URL = '<?= webAppUrl ?>';
+    var INITIAL_SAVED_SCHEDULE = <?!= savedScheduleJson ?>;
   </script>
   <script>
     (function () {
@@ -504,6 +680,22 @@
         btnArchiveCancel: document.getElementById('btnArchiveCancel'),
         archiveConfirmPanel: document.getElementById('archiveConfirmPanel'),
         btnDigest: document.getElementById('btnDigest'),
+        scheduleTaskTypeInputs: [
+          { id: 'unread', el: document.getElementById('taskUnread') },
+          { id: 'read', el: document.getElementById('taskRead') },
+          { id: 'archive', el: document.getElementById('taskArchive') },
+        ],
+        scheduleFrequency: document.getElementById('scheduleFrequency'),
+        scheduleTargetHour: document.getElementById('scheduleTargetHour'),
+        scheduleTimeRow: document.getElementById('scheduleTimeRow'),
+        scheduleDaysRow: document.getElementById('scheduleDaysRow'),
+        scheduleDayInputs: [
+          'SUNDAY', 'MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY', 'FRIDAY', 'SATURDAY',
+        ].map(function (day) { return document.getElementById('day' + day); }),
+        btnSaveSchedule: document.getElementById('btnSaveSchedule'),
+        scheduleStatus: document.getElementById('scheduleStatus'),
+        automationBanner: document.getElementById('automationBanner'),
+        automationBannerText: document.getElementById('automationBannerText'),
         status: document.getElementById('status'),
         output: document.getElementById('output'),
         outputMeta: document.getElementById('outputMeta'),
@@ -677,10 +869,16 @@
         els.btnClassifyRead.disabled = isBusy;
         els.btnArchive.disabled = isBusy;
         els.btnDigest.disabled = isBusy;
-        [els.btnCleanupUnread, els.btnClassifyRead, els.btnArchive, els.btnDigest].forEach(function (btn) {
+        els.btnSaveSchedule.disabled = isBusy;
+        [els.btnCleanupUnread, els.btnClassifyRead, els.btnArchive, els.btnDigest, els.btnSaveSchedule].forEach(function (btn) {
           btn.classList.toggle('is-loading', isBusy && btn === activeButton);
           btn.setAttribute('aria-busy', isBusy && btn === activeButton ? 'true' : 'false');
         });
+      }
+
+      function setScheduleStatus(message, type) {
+        els.scheduleStatus.textContent = message || '';
+        els.scheduleStatus.className = 'schedule-status' + (type ? ' ' + type : '');
       }
 
       function setStatus(message, type) {
@@ -705,6 +903,12 @@
         if (!token) throw new Error('Enter your API token in Connection settings.');
 
         var body = { action: action, token: token };
+        if (action === 'saveSchedule') {
+          body.taskTypes = options.taskTypes;
+          body.frequency = options.frequency;
+          body.targetDays = options.targetDays;
+          body.targetHour = options.targetHour;
+        }
 
         var response = await fetch(url, {
           method: 'POST',
@@ -716,6 +920,112 @@
         var data = JSON.parse(await response.text());
         if (!data.ok) throw new Error(data.error || 'Request failed.');
         return data;
+      }
+
+      function renderActiveScheduleBanner(schedule) {
+        schedule = schedule || {};
+        var active = !!(schedule.active || schedule.configured);
+        els.automationBanner.classList.toggle('inactive', !active);
+        els.automationBanner.classList.toggle('active', active);
+        els.automationBannerText.textContent = schedule.summary || schedule.message ||
+          (active ? 'Automation schedule is active.' : 'No automated schedule active.');
+      }
+
+      function collectTaskTypes() {
+        return els.scheduleTaskTypeInputs
+          .filter(function (item) { return item.el && item.el.checked; })
+          .map(function (item) { return item.id; });
+      }
+
+      function setTaskTypes(taskTypes) {
+        var selected = {};
+        (taskTypes || []).forEach(function (taskType) {
+          selected[String(taskType).toLowerCase()] = true;
+        });
+        els.scheduleTaskTypeInputs.forEach(function (item) {
+          if (item.el) item.el.checked = !!selected[item.id];
+        });
+      }
+
+      function scheduleNeedsDays(frequency) {
+        return frequency === 'weekly' || frequency === 'custom';
+      }
+
+      function updateScheduleUiState() {
+        var frequency = els.scheduleFrequency.value;
+        var needsDays = scheduleNeedsDays(frequency);
+        els.scheduleDaysRow.classList.toggle('hidden', !needsDays);
+        els.scheduleTimeRow.classList.toggle('hidden', !needsDays);
+      }
+
+      function collectTargetDays() {
+        return els.scheduleDayInputs
+          .filter(function (input) { return input && input.checked; })
+          .map(function (input) { return input.value; });
+      }
+
+      function setTargetDays(targetDays) {
+        var selected = {};
+        (targetDays || []).forEach(function (day) { selected[String(day).toUpperCase()] = true; });
+        els.scheduleDayInputs.forEach(function (input) {
+          if (input) input.checked = !!selected[input.value];
+        });
+      }
+
+      async function loadSchedule() {
+        try {
+          var data = useServerBridge
+            ? await callServer('dashboardGetSchedule')
+            : await postToWebApp('getSchedule');
+          if (data.taskTypes && data.taskTypes.length) {
+            setTaskTypes(data.taskTypes);
+          } else if (data.taskType) {
+            setTaskTypes([data.taskType]);
+          }
+          if (data.frequency) els.scheduleFrequency.value = data.frequency;
+          if (data.targetHour !== undefined && data.targetHour !== null) {
+            els.scheduleTargetHour.value = String(data.targetHour);
+          }
+          setTargetDays(data.targetDays || []);
+          updateScheduleUiState();
+          renderActiveScheduleBanner(data);
+          setScheduleStatus(data.message || '', data.configured ? 'success' : '');
+        } catch (err) {
+          setScheduleStatus('Could not load schedule.', '');
+        }
+      }
+
+      async function invokeSaveSchedule() {
+        setGlobalBusy(els.btnSaveSchedule, true);
+        setScheduleStatus('Saving schedule…', '');
+
+        try {
+          var frequency = els.scheduleFrequency.value;
+          var taskTypes = collectTaskTypes();
+          if (!taskTypes.length) {
+            throw new Error('Select at least one task type.');
+          }
+          var config = {
+            taskTypes: taskTypes,
+            frequency: frequency,
+            targetDays: scheduleNeedsDays(frequency) ? collectTargetDays() : [],
+            targetHour: scheduleNeedsDays(frequency)
+              ? parseInt(els.scheduleTargetHour.value, 10)
+              : 0,
+          };
+          if (scheduleNeedsDays(frequency) && !config.targetDays.length) {
+            throw new Error('Select at least one day of the week.');
+          }
+          var data = useServerBridge
+            ? await callServer('dashboardSaveSchedule', [config])
+            : await postToWebApp('saveSchedule', config);
+          renderActiveScheduleBanner(data);
+          setScheduleStatus(data.message || 'Schedule saved.', 'success');
+        } catch (err) {
+          setScheduleStatus(err.message || String(err), '');
+        } finally {
+          setGlobalBusy(null, false);
+        }
       }
 
       async function invokeCleanupUnread() {
@@ -810,7 +1120,16 @@
       els.btnArchiveConfirm.addEventListener('click', executeArchive);
       els.btnArchiveCancel.addEventListener('click', function () { showArchiveConfirm(false); });
       els.btnDigest.addEventListener('click', invokeDigest);
+      els.btnSaveSchedule.addEventListener('click', invokeSaveSchedule);
+      els.scheduleFrequency.addEventListener('change', updateScheduleUiState);
+
+      if (typeof INITIAL_SAVED_SCHEDULE === 'object' && INITIAL_SAVED_SCHEDULE !== null) {
+        renderActiveScheduleBanner(INITIAL_SAVED_SCHEDULE);
+      }
+
       loadSettings();
+      updateScheduleUiState();
+      loadSchedule();
     })();
   </script>
 </body>

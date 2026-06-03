@@ -8,12 +8,15 @@
 //   GEMINI_MODEL                — optional, default gemini-2.5-flash
 //   DASHBOARD_SPREADSHEET_ID    — optional; auto-created on first log if unset
 //   WEBAPP_API_SECRET           — required for Web App API (doPost); use a long random string
+//   SCHEDULE_CONFIG               — JSON: { taskTypes, frequency, targetDays, targetHour }
 
 const LABEL_NAME = 'CleanupQueue';
 const SPECIAL_KEEP = 'Keep';
 const SPECIAL_DELETE = 'Delete';
 const BATCH_SIZE = 200;
 const AI_BATCH_SIZE = 50;
+const READ_RULE_BATCH_SIZE = 10;
+const READ_AI_BATCH_SIZE = 5;
 const READ_EMAILS_SEARCH_QUERY = 'is:read in:inbox -label:CleanupQueue';
 const AI_SNIPPET_CHARS = 800;
 const DEFAULT_GEMINI_MODEL = 'gemini-2.5-flash';
@@ -23,7 +26,13 @@ const MAX_SCHEMA_ENUM_LABELS = 128;
 
 const DASHBOARD_LOG_SHEET = 'Classification Log';
 const DASHBOARD_SPREADSHEET_TITLE = 'Gmail Cleanup Dashboard';
-const DASHBOARD_HEADERS = ['Timestamp', 'Source', 'Sender', 'Subject', 'Action', 'Reason'];
+const DASHBOARD_HEADERS = ['Timestamp', 'Source', 'Sender', 'Subject', 'Action', 'Reason', 'Applied', 'Thread ID'];
+const LOG_COL_SOURCE = 1;
+const LOG_COL_ACTION = 4;
+const LOG_COL_REASON = 5;
+const LOG_COL_APPLIED = 6;
+const LOG_COL_THREAD_ID = 7;
+const SCHEDULE_SOURCE = 'Scheduler';
 const LAST_CLEANUP_RUN_KEY = 'LAST_CLEANUP_RUN_AT';
 
 /**
@@ -64,14 +73,7 @@ function ensureDashboardSpreadsheet() {
 /** One-time setup: create or bind the dashboard and ensure the log tab exists. */
 function setupDashboard() {
   var ss = ensureDashboardSpreadsheet();
-  var sheet = ss.getSheetByName(DASHBOARD_LOG_SHEET);
-  if (!sheet) {
-    sheet = ss.insertSheet(DASHBOARD_LOG_SHEET);
-  }
-  if (sheet.getLastRow() === 0) {
-    sheet.appendRow(DASHBOARD_HEADERS);
-    sheet.setFrozenRows(1);
-  }
+  getDashboardLogSheet(ss);
   Logger.log('Dashboard ready: ' + ss.getUrl());
   Logger.log('Log tab: "' + DASHBOARD_LOG_SHEET + '"');
   return ss.getUrl();
@@ -81,18 +83,114 @@ function getDashboardLogSheet(ss) {
   var sheet = ss.getSheetByName(DASHBOARD_LOG_SHEET);
   if (!sheet) {
     sheet = ss.insertSheet(DASHBOARD_LOG_SHEET);
+  }
+  ensureDashboardLogHeaders_(sheet);
+  return sheet;
+}
+
+function ensureDashboardLogHeaders_(sheet) {
+  if (sheet.getLastRow() === 0) {
     sheet.appendRow(DASHBOARD_HEADERS);
     sheet.setFrozenRows(1);
-  } else if (sheet.getLastRow() === 0) {
-    sheet.appendRow(DASHBOARD_HEADERS);
+    return;
+  }
+  var existing = sheet.getRange(1, 1, 1, Math.max(sheet.getLastColumn(), DASHBOARD_HEADERS.length)).getValues()[0];
+  if (String(existing[LOG_COL_APPLIED] || '') !== 'Applied' ||
+      String(existing[LOG_COL_THREAD_ID] || '') !== 'Thread ID') {
+    sheet.getRange(1, 1, 1, DASHBOARD_HEADERS.length).setValues([DASHBOARD_HEADERS]);
     sheet.setFrozenRows(1);
   }
-  return sheet;
+}
+
+function buildDashboardLogRow_(source, sender, subject, action, reason, thread, applied) {
+  var threadId = thread && thread.getId ? thread.getId() : '';
+  return [
+    new Date(),
+    source,
+    sender,
+    subject,
+    action,
+    reason,
+    applied ? 'yes' : 'no',
+    threadId,
+  ];
+}
+
+function isKeepAction_(action) {
+  return String(action || '').trim().toLowerCase() === 'keep';
+}
+
+function isSkippedAction_(action) {
+  return String(action || '').trim().toLowerCase() === 'skipped';
+}
+
+function isLogAppliedFlag_(value) {
+  var flag = String(value || '').trim().toLowerCase();
+  return flag === 'yes' || flag === 'no';
+}
+
+/** Thread ID column, or legacy column G before Applied was added. */
+function getLogThreadId_(row) {
+  var threadId = String(row[LOG_COL_THREAD_ID] || '').trim();
+  if (threadId) {
+    return threadId;
+  }
+  var legacy = row[LOG_COL_APPLIED];
+  if (!isLogAppliedFlag_(legacy)) {
+    return String(legacy || '').trim();
+  }
+  return '';
+}
+
+/**
+ * Whether a log row represents a label the script actually applied (archive-eligible).
+ * Uses Applied column when present; falls back for legacy rows without it.
+ */
+function isScriptLabelAppliedAction_(action, source, applied) {
+  if (isLogAppliedFlag_(applied)) {
+    return String(applied || '').trim().toLowerCase() === 'yes';
+  }
+
+  if (isKeepAction_(action) || isSkippedAction_(action)) {
+    return false;
+  }
+
+  var normalized = String(action || '').trim();
+  if (!normalized) {
+    return false;
+  }
+
+  if (normalized === LABEL_NAME || normalized.toLowerCase() === 'delete') {
+    return true;
+  }
+
+  var sourceName = String(source || '').trim();
+  if (sourceName === SCHEDULE_SOURCE) {
+    return false;
+  }
+
+  // Rule-Based pass only logs Keep or CleanupQueue.
+  if (sourceName === 'Rule-Based') {
+    return normalized === LABEL_NAME;
+  }
+
+  // Gemini pass: trust non-Keep script rows (covers labels later deleted from Gmail).
+  if (sourceName === 'Gemini AI') {
+    return true;
+  }
+
+  var labels = getExistingLabels();
+  for (var i = 0; i < labels.length; i++) {
+    if (labels[i].toLowerCase() === normalized.toLowerCase()) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /**
  * Appends classification rows to the dashboard sheet.
- * Each entry: [Date, source, sender, subject, action, reason]
+ * Each entry: [Date, source, sender, subject, action, reason, applied, threadId]
  * @param {Array<Array>} logEntries
  */
 function logToDashboard(logEntries) {
@@ -118,12 +216,26 @@ function logToDashboard(logEntries) {
       String(entry[3] || ''),
       String(entry[4] || ''),
       String(entry[5] || ''),
+      String(entry[6] || ''),
+      String(entry[7] || ''),
     ];
   });
 
   var startRow = sheet.getLastRow() + 1;
   sheet.getRange(startRow, 1, rows.length, DASHBOARD_HEADERS.length).setValues(rows);
   Logger.log('Dashboard: appended ' + rows.length + ' row(s) → ' + ss.getUrl());
+}
+
+function logSchedulerEvent_(action, reason) {
+  logToDashboard([buildDashboardLogRow_(
+    SCHEDULE_SOURCE,
+    'System',
+    'Automated task',
+    String(action || 'Event'),
+    String(reason || ''),
+    null,
+    false
+  )]);
 }
 
 const DELETE_DOMAINS = [
@@ -246,6 +358,12 @@ var DELETE_DOMAIN_INDEX = buildDomainIndex(DELETE_DOMAINS);
 var KEEP_DOMAIN_INDEX = buildDomainIndex(KEEP_DOMAINS);
 var DELETE_SUBJECT_REGEX = buildSubjectKeywordRegex(DELETE_SUBJECT_KEYWORDS);
 
+/** Gmail system category labels that map to Promotions / Social tabs. */
+var GMAIL_AUTO_DELETE_CATEGORIES = {
+  'CATEGORY_PROMOTIONS': true,
+  'CATEGORY_SOCIAL': true,
+};
+
 // --- Helpers ---
 
 function getGeminiApiKey() {
@@ -293,34 +411,131 @@ function senderMatches(fromLower, email, exactSet, listDesc) {
 }
 
 /**
- * @returns {'keep'|'delete'|null}
+ * Parses the header block from a raw RFC 822 message string.
+ * @param {string} raw
+ * @returns {Object.<string, string>}
  */
-function classifyByRules(sender, subject) {
+function parseRawMessageHeaders_(raw) {
+  var headers = {};
+  if (!raw) {
+    return headers;
+  }
+  var headerBlock = String(raw).split(/\r?\n\r?\n/)[0] || '';
+  var lines = headerBlock.split(/\r?\n/);
+  var currentName = '';
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i];
+    if (/^[\s\t]/.test(line) && currentName) {
+      headers[currentName] += ' ' + line.trim();
+      continue;
+    }
+    var colon = line.indexOf(':');
+    if (colon === -1) {
+      continue;
+    }
+    currentName = line.slice(0, colon).trim().toLowerCase();
+    headers[currentName] = line.slice(colon + 1).trim();
+  }
+  return headers;
+}
+
+/**
+ * @param {GoogleAppsScript.Gmail.GmailMessage} message
+ * @returns {Object.<string, string>}
+ */
+function getMessageHeaders_(message) {
+  if (!message) {
+    return {};
+  }
+  try {
+    return parseRawMessageHeaders_(message.getRawContent());
+  } catch (e) {
+    Logger.log('Header parse failed: ' + e.message);
+    return {};
+  }
+}
+
+function messageHasListUnsubscribe_(message) {
+  var value = getMessageHeaders_(message)['list-unsubscribe'] || '';
+  return !!String(value).trim();
+}
+
+/**
+ * @param {GoogleAppsScript.Gmail.GmailThread} thread
+ * @returns {string[]}
+ */
+function getThreadGmailCategoryNames_(thread) {
+  var names = [];
+  if (!thread || !thread.getLabels) {
+    return names;
+  }
+  try {
+    thread.getLabels().forEach(function(label) {
+      var name = label.getName();
+      if (GMAIL_AUTO_DELETE_CATEGORIES[name]) {
+        names.push(GMAIL_AUTO_DELETE_CATEGORIES[name]);
+      }
+    });
+  } catch (e) {
+    Logger.log('Category label read failed: ' + e.message);
+  }
+  return names;
+}
+
+/**
+ * @param {GoogleAppsScript.Gmail.GmailThread} thread
+ * @returns {boolean}
+ */
+function threadHasAutoDeleteGmailCategory_(thread) {
+  return getThreadGmailCategoryNames_(thread).length > 0;
+}
+
+/**
+ * @param {string} sender
+ * @param {string} subject
+ * @param {GoogleAppsScript.Gmail.GmailMessage=} message
+ * @param {GoogleAppsScript.Gmail.GmailThread=} thread
+ * @returns {{verdict: string, reason: string}|null}
+ */
+function classifyByRules(sender, subject, message, thread) {
   var fromLower = sender.toLowerCase();
   var email = extractEmailAddress(sender);
   var domain = extractDomain(sender);
   var subjectLower = subject.toLowerCase();
 
   if (senderMatches(fromLower, email, KEEP_SENDERS_SET, KEEP_SENDERS_DESC)) {
-    return 'keep';
+    return { verdict: 'keep', reason: 'Matched keep sender' };
   }
   if (domainMatchesIndex(domain, KEEP_DOMAIN_INDEX)) {
-    return 'keep';
+    return { verdict: 'keep', reason: 'Matched keep domain' };
   }
+
+  if (message && messageHasListUnsubscribe_(message)) {
+    return { verdict: 'delete', reason: 'List-Unsubscribe header' };
+  }
+
+  if (thread && threadHasAutoDeleteGmailCategory_(thread)) {
+    return {
+      verdict: 'delete',
+      reason: 'Gmail category: ' + getThreadGmailCategoryNames_(thread).join(', '),
+    };
+  }
+
   if (senderMatches(fromLower, email, DELETE_SENDERS_SET, DELETE_SENDERS_DESC)) {
-    return 'delete';
+    return { verdict: 'delete', reason: 'Matched delete sender' };
   }
   if (domainMatchesIndex(domain, DELETE_DOMAIN_INDEX)) {
-    return 'delete';
+    return { verdict: 'delete', reason: 'Matched delete domain' };
   }
   if (DELETE_SUBJECT_REGEX && DELETE_SUBJECT_REGEX.test(subjectLower)) {
-    return 'delete';
+    return { verdict: 'delete', reason: 'Matched delete subject keyword' };
   }
   return null;
 }
 
-function ruleShouldDelete(sender, subject) {
-  return classifyByRules(sender, subject) === 'delete';
+function ruleShouldDelete(sender, subject, message, thread) {
+  var result = classifyByRules(sender, subject, message, thread);
+  return !!(result && result.verdict === 'delete');
 }
 
 /**
@@ -359,18 +574,65 @@ function buildMultiLabelSystemPrompt(existingLabels) {
     : '(none configured — use Keep or Delete only)';
 
   return (
-    'You are an email triage assistant. Classify mail for someone running a startup, doing software development, and managing personal life.\n' +
-    'For each email, assign exactly one outcome: a user Gmail label from the list below, or a special value.\n\n' +
-    'USER GMAIL LABELS (use the exact string when it fits):\n' +
+    'You are an email triage assistant. You receive batches of messages with metadata and body snippets.\n' +
+    'Analyze each batch on its own: infer who sends bulk mail, which items are newsletters or marketing, ' +
+    'which are direct personal or operational mail, and which automated notices look actionable.\n' +
+    'Do not assume any fixed job, industry, or inbox profile — reason only from batch evidence and the label list below.\n\n' +
+    'USER GMAIL LABELS (exact strings — your only custom taxonomy):\n' +
     labelLines + '\n\n' +
     'SPECIAL VALUES:\n' +
-    '- "' + SPECIAL_KEEP + '": Keep in inbox when no label fits — messages from real people; startup operations (customers, partners, hiring, finance, legal); software/dev work (code, CI/CD, cloud, APIs, vendors, security); personal life (family, health, home, travel, accounts); receipts and transactional mail you may need later.\n' +
-    '- "' + SPECIAL_DELETE + '": Aggressively delete junk — marketing, newsletters, promotions, retail deals, product updates, drip campaigns, event invites from brands, LinkedIn/social digests, SaaS nurture mail, job-alert spam, and any automated notification that is not actionable.\n\n' +
-    'Rules: Prefer ' + SPECIAL_DELETE + ' for clear marketing and bulk mail. When uncertain between a custom label and ' + SPECIAL_KEEP + ', prefer ' + SPECIAL_KEEP + ' only if the message looks personally or operationally important.\n' +
-    'Never invent label names — only values from the list above or the two special values.\n\n' +
+    '- "' + SPECIAL_KEEP + '": Leave in inbox when no user label fits and the message appears individually important ' +
+    '(direct human correspondence, actionable requests, reservations or receipts you may need, security or account alerts, ' +
+    'time-sensitive coordination). When unsure between a custom label and ' + SPECIAL_KEEP + ', choose ' + SPECIAL_KEEP +
+    ' only if importance is clear from the content.\n' +
+    '- "' + SPECIAL_DELETE + '": Junk or low-value bulk. Use for promotional blasts, newsletters, drip campaigns, ' +
+    'marketing automation, social or network digests, retailer deals, product-update spam, and non-actionable bulk notifications. ' +
+    'Be decisive when metadata or copy signals mass mail (List-Unsubscribe, List-Id, marketing footers, percent-off language, etc.).\n\n' +
+    'Rules:\n' +
+    '- Never invent label names — only strings from the user label list or the two special values.\n' +
+    '- Compare each email to patterns across the batch, not stereotypical personas.\n' +
+    '- Assign exactly one outcome per email.\n' +
+    '- Prefer ' + SPECIAL_DELETE + ' for clear marketing and bulk mail.\n\n' +
     'Respond with ONLY a JSON array — no markdown:\n' +
     '[{"index": 1, "suggestedLabel": "LabelName", "reason": "one short phrase"}, ...]'
   );
+}
+
+/**
+ * @param {number} index 1-based
+ * @param {GoogleAppsScript.Gmail.GmailMessage} message
+ * @param {GoogleAppsScript.Gmail.GmailThread} thread
+ * @returns {string}
+ */
+function formatEmailForGemini_(index, message, thread) {
+  var parts = [
+    index + '. From: ' + message.getFrom(),
+    'Subject: ' + message.getSubject(),
+  ];
+  var headers = getMessageHeaders_(message);
+  if (headers['list-unsubscribe']) {
+    parts.push('List-Unsubscribe: yes');
+  }
+  if (headers['list-id']) {
+    parts.push('List-Id: present');
+  }
+  if (headers['precedence']) {
+    parts.push('Precedence: ' + headers['precedence']);
+  }
+  var categories = getThreadGmailCategoryNames_(thread);
+  if (categories.length) {
+    parts.push('Gmail categories: ' + categories.join(', '));
+  }
+  parts.push('Snippet: ' + (message.getPlainBody() || '').slice(0, AI_SNIPPET_CHARS));
+  return parts.join(' | ');
+}
+
+function buildGeminiBatchUserPrompt_(threads) {
+  var lines = threads.map(function(thread, i) {
+    var msg = thread.getMessages()[0];
+    return formatEmailForGemini_(i + 1, msg, thread);
+  });
+  return 'Emails to classify:\n' + lines.join('\n');
 }
 
 function buildMultiLabelResponseSchema(existingLabels) {
@@ -520,10 +782,6 @@ function buildInboxSearchQuery_(includeRead) {
   return query;
 }
 
-function buildReviewedArchiveQuery_() {
-  return 'label:' + LABEL_NAME + ' in:inbox';
-}
-
 function applyCleanupQueueAction_(thread, label, wasUnread) {
   thread.addLabel(label);
   if (wasUnread) {
@@ -547,17 +805,17 @@ function classifyInbox(includeRead) {
     var msg = thread.getMessages()[0];
     var sender = msg.getFrom();
     var subject = msg.getSubject();
-    var verdict = classifyByRules(sender, subject);
+    var ruleResult = classifyByRules(sender, subject, msg, thread);
 
-    if (verdict === 'keep') {
-      logEntries.push([new Date(), 'Rule-Based', sender, subject, 'Keep', 'Matched Rule']);
+    if (ruleResult && ruleResult.verdict === 'keep') {
+      logEntries.push(buildDashboardLogRow_('Rule-Based', sender, subject, 'Keep', ruleResult.reason, thread, false));
       kept++;
       return;
     }
 
-    if (verdict === 'delete') {
+    if (ruleResult && ruleResult.verdict === 'delete') {
       applyCleanupQueueAction_(thread, label, wasUnread);
-      logEntries.push([new Date(), 'Rule-Based', sender, subject, LABEL_NAME, 'Matched Rule']);
+      logEntries.push(buildDashboardLogRow_('Rule-Based', sender, subject, LABEL_NAME, ruleResult.reason, thread, true));
       Logger.log('-> CleanupQueue' + (wasUnread ? ' (archived)' : ' (left in inbox)') + ': ' + subject);
       tagged++;
     } else {
@@ -603,14 +861,7 @@ function classifyUnclassified(includeRead) {
     return;
   }
 
-  var items = threads.map(function(thread, i) {
-    var msg = thread.getMessages()[0];
-    return (i + 1) + '. From: ' + msg.getFrom() +
-      ' | Subject: ' + msg.getSubject() +
-      ' | Snippet: ' + (msg.getPlainBody() || '').slice(0, AI_SNIPPET_CHARS);
-  });
-
-  var userPrompt = 'Emails to classify:\n' + items.join('\n');
+  var userPrompt = buildGeminiBatchUserPrompt_(threads);
 
   var rawText;
   try {
@@ -645,10 +896,9 @@ function classifyUnclassified(includeRead) {
     var resolved = resolveSuggestedLabel(rawLabel, existingLabels);
     var reason = d.reason || '';
 
-    logEntries.push([new Date(), 'Gemini AI', sender, subject, decision, reason]);
-
     if (resolved === SPECIAL_DELETE) {
       applyCleanupQueueAction_(thread, cleanupLabel, wasUnread);
+      logEntries.push(buildDashboardLogRow_('Gemini AI', sender, subject, LABEL_NAME, reason, thread, true));
       Logger.log('-> ' + LABEL_NAME + ' [Delete' + (wasUnread ? ', archived' : ', left in inbox') + ']: ' +
         subject + ' — ' + reason);
       deleted++;
@@ -656,6 +906,7 @@ function classifyUnclassified(includeRead) {
     }
 
     if (resolved === SPECIAL_KEEP) {
+      logEntries.push(buildDashboardLogRow_('Gemini AI', sender, subject, 'Keep', reason, thread, false));
       Logger.log('Keep [AI]: ' + subject + ' — ' + reason);
       kept++;
       return;
@@ -664,11 +915,21 @@ function classifyUnclassified(includeRead) {
     var entry = labelLookup[resolved.toLowerCase()];
     if (entry) {
       thread.addLabel(entry.label);
+      logEntries.push(buildDashboardLogRow_('Gemini AI', sender, subject, entry.name, reason, thread, true));
       Logger.log('-> Label "' + entry.name + '": ' + subject + ' — ' + reason);
       labeled++;
       return;
     }
 
+    logEntries.push(buildDashboardLogRow_(
+      'Gemini AI',
+      sender,
+      subject,
+      'Skipped',
+      'Unrecognized label: ' + rawLabel,
+      thread,
+      false
+    ));
     Logger.log('? Unknown label "' + rawLabel + '", left in inbox: ' + subject);
     skipped++;
   });
@@ -703,23 +964,23 @@ function classifyReadEmails() {
   // --- Pass 1: rule-based (read inbox only) ---
   var logEntries = [];
   var tagged = 0, kept = 0, unclassified = 0;
-  var ruleThreads = GmailApp.search(READ_EMAILS_SEARCH_QUERY, 0, BATCH_SIZE);
+  var ruleThreads = GmailApp.search(READ_EMAILS_SEARCH_QUERY, 0, READ_RULE_BATCH_SIZE);
 
   ruleThreads.forEach(function(thread) {
     var msg = thread.getMessages()[0];
     var sender = msg.getFrom();
     var subject = msg.getSubject();
-    var verdict = classifyByRules(sender, subject);
+    var ruleResult = classifyByRules(sender, subject, msg, thread);
 
-    if (verdict === 'keep') {
-      logEntries.push([new Date(), 'Rule-Based', sender, subject, 'Keep', 'Matched Rule']);
+    if (ruleResult && ruleResult.verdict === 'keep') {
+      logEntries.push(buildDashboardLogRow_('Rule-Based', sender, subject, 'Keep', ruleResult.reason, thread, false));
       kept++;
       return;
     }
 
-    if (verdict === 'delete') {
+    if (ruleResult && ruleResult.verdict === 'delete') {
       thread.addLabel(cleanupLabel);
-      logEntries.push([new Date(), 'Rule-Based', sender, subject, LABEL_NAME, 'Matched Rule']);
+      logEntries.push(buildDashboardLogRow_('Rule-Based', sender, subject, LABEL_NAME, ruleResult.reason, thread, true));
       Logger.log('-> CleanupQueue [read, inbox]: ' + subject);
       tagged++;
       return;
@@ -750,23 +1011,16 @@ function classifyReadEmails() {
   Logger.log('User labels for AI (' + existingLabels.length + '): ' +
     (existingLabels.length ? existingLabels.join(', ') : '(none)'));
 
-  var aiThreads = GmailApp.search(READ_EMAILS_SEARCH_QUERY, 0, AI_BATCH_SIZE);
+  var aiThreads = GmailApp.search(READ_EMAILS_SEARCH_QUERY, 0, READ_AI_BATCH_SIZE);
   if (aiThreads.length === 0) {
     Logger.log('No read emails remaining for AI pass.');
     logToDashboard(aiLogEntries);
     return;
   }
 
-  var items = aiThreads.map(function(thread, i) {
-    var msg = thread.getMessages()[0];
-    return (i + 1) + '. From: ' + msg.getFrom() +
-      ' | Subject: ' + msg.getSubject() +
-      ' | Snippet: ' + (msg.getPlainBody() || '').slice(0, AI_SNIPPET_CHARS);
-  });
-
   var rawText;
   try {
-    rawText = callGemini('Emails to classify:\n' + items.join('\n'), existingLabels);
+    rawText = callGemini(buildGeminiBatchUserPrompt_(aiThreads), existingLabels);
   } catch (err) {
     Logger.log('ERROR: ' + err.message);
     return;
@@ -796,16 +1050,16 @@ function classifyReadEmails() {
     var resolved = resolveSuggestedLabel(rawLabel, existingLabels);
     var reason = d.reason || '';
 
-    aiLogEntries.push([new Date(), 'Gemini AI', sender, subject, decision, reason]);
-
     if (resolved === SPECIAL_DELETE) {
       thread.addLabel(cleanupLabel);
+      aiLogEntries.push(buildDashboardLogRow_('Gemini AI', sender, subject, LABEL_NAME, reason, thread, true));
       Logger.log('-> ' + LABEL_NAME + ' [read, inbox]: ' + subject + ' — ' + reason);
       deleted++;
       return;
     }
 
     if (resolved === SPECIAL_KEEP) {
+      aiLogEntries.push(buildDashboardLogRow_('Gemini AI', sender, subject, 'Keep', reason, thread, false));
       Logger.log('Keep [read, AI]: ' + subject + ' — ' + reason);
       keptAi++;
       return;
@@ -814,11 +1068,21 @@ function classifyReadEmails() {
     var entry = labelLookup[resolved.toLowerCase()];
     if (entry) {
       thread.addLabel(entry.label);
+      aiLogEntries.push(buildDashboardLogRow_('Gemini AI', sender, subject, entry.name, reason, thread, true));
       Logger.log('-> Label "' + entry.name + '" [read]: ' + subject + ' — ' + reason);
       labeled++;
       return;
     }
 
+    aiLogEntries.push(buildDashboardLogRow_(
+      'Gemini AI',
+      sender,
+      subject,
+      'Skipped',
+      'Unrecognized label: ' + rawLabel,
+      thread,
+      false
+    ));
     Logger.log('? Unknown label "' + rawLabel + '", left in inbox: ' + subject);
     skipped++;
   });
@@ -849,34 +1113,100 @@ function runFullCleanup(includeRead) {
 }
 
 /**
- * Archives inbox threads tagged CleanupQueue (read and unread) after review.
- * @returns {{archived: number, message: string}}
+ * Returns thread IDs the script labeled (not Keep) since the last cleanup run.
+ * @returns {string[]}
  */
-function archiveReviewedCleanupItems() {
-  var query = buildReviewedArchiveQuery_();
-  var archived = 0;
-  var batchSize = 100;
+function getScriptLabeledThreadIdsSinceLastRun_() {
+  var lastRunAt = getLastCleanupRunAt_();
+  if (!lastRunAt) {
+    return [];
+  }
 
-  while (true) {
-    var threads = GmailApp.search(query, 0, batchSize);
-    if (!threads.length) {
-      break;
+  var ss;
+  try {
+    ss = ensureDashboardSpreadsheet();
+  } catch (e) {
+    Logger.log('Could not read dashboard log: ' + e.message);
+    return [];
+  }
+
+  var sheet = ss.getSheetByName(DASHBOARD_LOG_SHEET);
+  if (!sheet || sheet.getLastRow() <= 1) {
+    return [];
+  }
+
+  var numRows = sheet.getLastRow() - 1;
+  var numCols = Math.max(sheet.getLastColumn(), DASHBOARD_HEADERS.length);
+  var rawRows = sheet.getRange(2, 1, numRows, numCols).getValues();
+  var ids = {};
+  var cutoff = lastRunAt;
+
+  for (var i = rawRows.length - 1; i >= 0; i--) {
+    var row = rawRows[i];
+    var ts = row[0];
+    if (!(ts instanceof Date)) {
+      ts = new Date(ts);
+    }
+    if (isNaN(ts.getTime()) || ts < cutoff) {
+      continue;
     }
 
-    threads.forEach(function(thread) {
-      thread.moveToArchive();
-      archived++;
-    });
+    var action = String(row[LOG_COL_ACTION] || '');
+    if (!isScriptLabelAppliedAction_(action, String(row[LOG_COL_SOURCE] || ''), row[LOG_COL_APPLIED])) {
+      continue;
+    }
 
-    if (threads.length < batchSize) {
-      break;
+    var threadId = getLogThreadId_(row);
+    if (threadId) {
+      ids[threadId] = true;
     }
   }
 
-  Logger.log('Archived reviewed CleanupQueue threads: ' + archived);
+  return Object.keys(ids);
+}
+
+/**
+ * Archives inbox threads the script labeled since the last run (by thread ID in the log).
+ * Ignores current labels — includes mail even if you relabeled manually.
+ * @returns {{archived: number, skipped: number, message: string}}
+ */
+function archiveReviewedCleanupItems() {
+  var threadIds = getScriptLabeledThreadIdsSinceLastRun_();
+  if (!threadIds.length) {
+    return {
+      archived: 0,
+      skipped: 0,
+      message: buildArchiveReviewedMessage_(0, 0),
+    };
+  }
+
+  var archived = 0;
+  var skipped = 0;
+
+  threadIds.forEach(function(threadId) {
+    try {
+      var thread = GmailApp.getThreadById(threadId);
+      if (!thread) {
+        skipped++;
+        return;
+      }
+      if (!thread.isInInbox()) {
+        skipped++;
+        return;
+      }
+      thread.moveToArchive();
+      archived++;
+    } catch (e) {
+      Logger.log('Archive skip ' + threadId + ': ' + e.message);
+      skipped++;
+    }
+  });
+
+  Logger.log('Archived script-labeled threads: ' + archived + ', skipped: ' + skipped);
   return {
     archived: archived,
-    message: buildArchiveReviewedMessage_(archived),
+    skipped: skipped,
+    message: buildArchiveReviewedMessage_(archived, skipped),
   };
 }
 
@@ -885,12 +1215,19 @@ function archiveReviewedReadCleanupItems() {
   return archiveReviewedCleanupItems();
 }
 
-function buildArchiveReviewedMessage_(archived) {
-  if (!archived) {
-    return 'No CleanupQueue emails found in your inbox to archive.';
+function buildArchiveReviewedMessage_(archived, skipped) {
+  if (!archived && !skipped) {
+    return 'No script-labeled emails from the last run are waiting in your inbox to archive. Run Classify Read or Cleanup Unread first.';
   }
-  return 'Archived ' + archived + ' reviewed email' + (archived === 1 ? '' : 's') +
-    ' from your inbox.';
+  if (!archived) {
+    return 'Nothing to archive — script-labeled emails from the last run are already out of the inbox.';
+  }
+  var message = 'Archived ' + archived + ' email' + (archived === 1 ? '' : 's') +
+    ' the script labeled during the last run';
+  if (skipped) {
+    message += ' (' + skipped + ' already archived or not found)';
+  }
+  return message + '.';
 }
 
 function markCleanupRunStart_() {
@@ -936,8 +1273,8 @@ function testGeminiKey() {
 /** Sheet only — create/bind dashboard + write sample rows (no Gmail changes). */
 function testLogToDashboard() {
   var sampleRows = [
-    [new Date(), 'Test', 'alice@example.com', 'Sample keep row', 'Keep', 'Manual test'],
-    [new Date(), 'Test', 'newsletter@marketing.com', 'Sample delete row', 'CleanupQueue', 'Manual test'],
+    buildDashboardLogRow_('Test', 'alice@example.com', 'Sample keep row', 'Keep', 'Manual test', null, false),
+    buildDashboardLogRow_('Test', 'newsletter@marketing.com', 'Sample delete row', 'CleanupQueue', 'Manual test', null, true),
   ];
   logToDashboard(sampleRows);
   Logger.log('Done. Check the Classification Log tab in your dashboard sheet.');
@@ -946,6 +1283,409 @@ function testLogToDashboard() {
 /** Sheet only — ensure dashboard exists; no Gmail, no logging. */
 function runSetupDashboardOnly() {
   setupDashboard();
+}
+
+// --- Scheduled tasks ---
+
+var SCHEDULE_CONFIG_KEY = 'SCHEDULE_CONFIG';
+var SCHEDULE_TRIGGER_HANDLER = 'executeScheduledTask';
+var SCHEDULE_WEEK_DAYS = [
+  'SUNDAY', 'MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY', 'FRIDAY', 'SATURDAY',
+];
+var SCHEDULE_TASK_TYPE_ORDER = ['unread', 'read', 'archive'];
+
+function loadSavedScheduleConfig_() {
+  var props = PropertiesService.getScriptProperties();
+  var raw = props.getProperty(SCHEDULE_CONFIG_KEY);
+  if (raw) {
+    try {
+      return normalizeScheduleConfig_(JSON.parse(raw));
+    } catch (e) {
+      Logger.log('Invalid SCHEDULE_CONFIG JSON: ' + e.message);
+    }
+  }
+  return migrateLegacySchedule_(props);
+}
+
+/**
+ * Returns the active schedule for the dashboard and API.
+ * @returns {Object}
+ */
+function getSavedSchedule() {
+  var config = loadSavedScheduleConfig_();
+  if (!config.configured) {
+    return {
+      active: false,
+      configured: false,
+      message: 'No automated schedule active.',
+      summary: 'No automated schedule active.',
+    };
+  }
+
+  return {
+    active: true,
+    configured: true,
+    taskTypes: config.taskTypes,
+    taskType: config.taskTypes[0] || '',
+    frequency: config.frequency,
+    targetDays: config.targetDays,
+    targetHour: config.targetHour,
+    message: buildScheduleSavedMessage_(config),
+    summary: buildScheduleDisplaySummary_(config),
+  };
+}
+
+function buildScheduleDisplaySummary_(config) {
+  var tasks = formatScheduleTaskTypesLabel_(config.taskTypes);
+  if (config.frequency === 'hourly') {
+    return 'Active: ' + tasks + ' running hourly.';
+  }
+  if (config.frequency === 'every6hours') {
+    return 'Active: ' + tasks + ' running every 6 hours.';
+  }
+
+  var days = formatScheduleDaysLabel_(config.targetDays);
+  var time = formatScheduleHourLabel_(config.targetHour);
+  if (config.frequency === 'weekly') {
+    return 'Active: ' + tasks + ' running every ' + days + ' at ' + time + '.';
+  }
+  return 'Active: ' + tasks + ' running on ' + days + ' at ' + time + '.';
+}
+
+function migrateLegacySchedule_(props) {
+  var taskType = props.getProperty('SCHEDULE_TASK_TYPE') || '';
+  var frequency = props.getProperty('SCHEDULE_FREQUENCY') || '';
+  if (!taskType || !frequency) {
+    return normalizeScheduleConfig_({});
+  }
+
+  var config = {
+    taskTypes: normalizeScheduleTaskTypes_({ taskType: taskType }),
+    frequency: frequency,
+    targetDays: [],
+    targetHour: 0,
+  };
+
+  if (frequency === 'dailyMidnight') {
+    config.frequency = 'custom';
+    config.targetDays = SCHEDULE_WEEK_DAYS.slice();
+    config.targetHour = 0;
+  }
+
+  return normalizeScheduleConfig_(config);
+}
+
+function normalizeScheduleConfig_(config) {
+  config = config || {};
+  var taskTypes = normalizeScheduleTaskTypes_(config);
+  var frequency = normalizeScheduleFrequency_(config.frequency) || '';
+  var targetDays = normalizeScheduleDays_(config.targetDays);
+  var targetHour = normalizeScheduleHour_(config.targetHour);
+
+  return {
+    taskTypes: taskTypes,
+    frequency: frequency,
+    targetDays: targetDays,
+    targetHour: targetHour,
+    configured: !!(taskTypes.length && frequency),
+  };
+}
+
+function normalizeScheduleTaskTypes_(config) {
+  config = config || {};
+  var types = [];
+  var list = [];
+
+  if (config.taskTypes) {
+    list = Array.isArray(config.taskTypes) ? config.taskTypes : String(config.taskTypes).split(',');
+  } else if (config.taskType) {
+    list = [config.taskType];
+  }
+
+  list.forEach(function(value) {
+    var normalized = normalizeScheduleTaskType_(value);
+    if (normalized && types.indexOf(normalized) === -1) {
+      types.push(normalized);
+    }
+  });
+
+  types.sort(function(a, b) {
+    return SCHEDULE_TASK_TYPE_ORDER.indexOf(a) - SCHEDULE_TASK_TYPE_ORDER.indexOf(b);
+  });
+
+  return types;
+}
+
+function normalizeScheduleTaskType_(value) {
+  var key = String(value || '').toLowerCase().replace(/[\s_-]+/g, '');
+  if (key === 'unread' || key === 'classifyunreadonly') return 'unread';
+  if (key === 'read' || key === 'classifyreadonly') return 'read';
+  if (key === 'archive' || key === 'archiverevieweditems') return 'archive';
+  return null;
+}
+
+function normalizeScheduleFrequency_(value) {
+  var key = String(value || '').toLowerCase().replace(/[\s_-]+/g, '');
+  if (key === 'hourly') return 'hourly';
+  if (key === 'every6hours') return 'every6hours';
+  if (key === 'weekly') return 'weekly';
+  if (key === 'custom' || key === 'customday') return 'custom';
+  if (key === 'dailymidnight' || key === 'dailyatmidnight') return 'custom';
+  return null;
+}
+
+function normalizeScheduleDay_(value) {
+  var key = String(value || '').toUpperCase().replace(/[\s_-]+/g, '');
+  if (key === 'SUN' || key === 'SUNDAY') return 'SUNDAY';
+  if (key === 'MON' || key === 'MONDAY') return 'MONDAY';
+  if (key === 'TUE' || key === 'TUESDAY') return 'TUESDAY';
+  if (key === 'WED' || key === 'WEDNESDAY') return 'WEDNESDAY';
+  if (key === 'THU' || key === 'THURSDAY') return 'THURSDAY';
+  if (key === 'FRI' || key === 'FRIDAY') return 'FRIDAY';
+  if (key === 'SAT' || key === 'SATURDAY') return 'SATURDAY';
+  return null;
+}
+
+function normalizeScheduleDays_(days) {
+  if (!days) return [];
+  var list = Array.isArray(days) ? days : String(days).split(',');
+  var seen = {};
+  var normalized = [];
+  list.forEach(function(day) {
+    var value = normalizeScheduleDay_(day);
+    if (value && !seen[value]) {
+      seen[value] = true;
+      normalized.push(value);
+    }
+  });
+  return normalized;
+}
+
+function normalizeScheduleHour_(value) {
+  var hour = parseInt(value, 10);
+  if (isNaN(hour) || hour < 0 || hour > 23) {
+    return 0;
+  }
+  return hour;
+}
+
+function getScheduleTaskLabel_(taskType) {
+  if (taskType === 'unread') return 'Classify Unread Only';
+  if (taskType === 'read') return 'Classify Read Only';
+  if (taskType === 'archive') return 'Archive Reviewed Items';
+  return taskType;
+}
+
+function formatScheduleTaskTypesLabel_(taskTypes) {
+  if (!taskTypes || !taskTypes.length) return 'No tasks selected';
+  return taskTypes.map(getScheduleTaskLabel_).join(' + ');
+}
+
+function runScheduledTaskType_(taskType) {
+  if (taskType === 'unread') {
+    runFullCleanup(false);
+    return;
+  }
+  if (taskType === 'read') {
+    classifyReadEmails();
+    return;
+  }
+  if (taskType === 'archive') {
+    archiveReviewedCleanupItems();
+    return;
+  }
+  throw new Error('Unknown scheduled task type: ' + taskType);
+}
+
+function getScheduleFrequencyLabel_(frequency) {
+  if (frequency === 'hourly') return 'Hourly';
+  if (frequency === 'every6hours') return 'Every 6 Hours';
+  if (frequency === 'weekly') return 'Weekly';
+  if (frequency === 'custom') return 'Custom Day';
+  return frequency;
+}
+
+function formatScheduleHourLabel_(hour) {
+  if (hour === 0) return '12:00 AM (Midnight)';
+  if (hour === 12) return '12:00 PM (Noon)';
+  if (hour < 12) return hour + ':00 AM';
+  return (hour - 12) + ':00 PM';
+}
+
+function formatScheduleDaysLabel_(targetDays) {
+  if (!targetDays || !targetDays.length) return '';
+  return targetDays.map(function(day) {
+    return day.charAt(0) + day.slice(1, 3).toLowerCase();
+  }).join(', ');
+}
+
+function buildScheduleSavedMessage_(config) {
+  var parts = [
+    'Schedule saved: ' + formatScheduleTaskTypesLabel_(config.taskTypes),
+    getScheduleFrequencyLabel_(config.frequency),
+  ];
+  if (config.frequency === 'weekly' || config.frequency === 'custom') {
+    parts.push(formatScheduleDaysLabel_(config.targetDays));
+    parts.push('at ' + formatScheduleHourLabel_(config.targetHour));
+  }
+  return parts.filter(function(part) { return part; }).join(' — ') + '.';
+}
+
+function persistScheduleConfig_(config) {
+  PropertiesService.getScriptProperties().setProperty(
+    SCHEDULE_CONFIG_KEY,
+    JSON.stringify(config)
+  );
+}
+
+/**
+ * Deletes all project triggers and recreates them from the saved schedule config.
+ * @param {Object} config
+ */
+function rebuildSystemTriggers(config) {
+  config = normalizeScheduleConfig_(config);
+
+  ScriptApp.getProjectTriggers().forEach(function(trigger) {
+    ScriptApp.deleteTrigger(trigger);
+  });
+
+  if (config.frequency === 'hourly') {
+    ScriptApp.newTrigger(SCHEDULE_TRIGGER_HANDLER).timeBased().everyHours(1).create();
+    return;
+  }
+
+  if (config.frequency === 'every6hours') {
+    ScriptApp.newTrigger(SCHEDULE_TRIGGER_HANDLER).timeBased().everyHours(6).create();
+    return;
+  }
+
+  if (config.frequency === 'weekly' || config.frequency === 'custom') {
+    if (!config.targetDays.length) {
+      throw new Error('Select at least one day of the week.');
+    }
+
+    config.targetDays.forEach(function(dayName) {
+      var weekDay = ScriptApp.WeekDay[dayName];
+      if (!weekDay) {
+        throw new Error('Invalid weekday: ' + dayName);
+      }
+      ScriptApp.newTrigger(SCHEDULE_TRIGGER_HANDLER)
+        .timeBased()
+        .onWeekDay(weekDay)
+        .atHour(config.targetHour)
+        .create();
+    });
+    return;
+  }
+
+  throw new Error('Unsupported schedule frequency: ' + config.frequency);
+}
+
+function scheduleApiResponse_() {
+  var saved = getSavedSchedule();
+  return {
+    active: saved.active,
+    configured: saved.configured,
+    taskTypes: saved.taskTypes || [],
+    taskType: saved.taskType || (saved.taskTypes && saved.taskTypes[0]) || 'unread',
+    frequency: saved.frequency || 'weekly',
+    targetDays: saved.targetDays || [],
+    targetHour: saved.targetHour || 0,
+    summary: saved.summary,
+    message: saved.message,
+  };
+}
+
+/**
+ * Saves schedule preferences and reinstalls triggers.
+ * @param {Object|string} taskTypeOrConfig
+ * @param {string=} frequency
+ * @param {Array|string=} targetDays
+ * @param {number=} targetHour
+ */
+function saveUserSchedule(taskTypeOrConfig, frequency, targetDays, targetHour) {
+  var input = taskTypeOrConfig;
+  if (input && typeof input === 'object' && !(input instanceof Date)) {
+    input = input;
+  } else {
+    input = {
+      taskType: taskTypeOrConfig,
+      frequency: frequency,
+      targetDays: targetDays,
+      targetHour: targetHour,
+    };
+  }
+
+  var config = normalizeScheduleConfig_(input);
+  if (!config.taskTypes.length) {
+    throw new Error('Select at least one task type.');
+  }
+  if (!config.frequency) {
+    throw new Error('Invalid frequency. Use hourly, every6hours, weekly, or custom.');
+  }
+  if ((config.frequency === 'weekly' || config.frequency === 'custom') && !config.targetDays.length) {
+    throw new Error('Select at least one day of the week.');
+  }
+
+  persistScheduleConfig_(config);
+  rebuildSystemTriggers(config);
+
+  Logger.log('Schedule installed: ' + JSON.stringify(config));
+  logSchedulerEvent_('Configured', buildScheduleSavedMessage_(config));
+
+  return {
+    ok: true,
+    taskTypes: config.taskTypes,
+    taskType: config.taskTypes[0] || '',
+    frequency: config.frequency,
+    targetDays: config.targetDays,
+    targetHour: config.targetHour,
+    message: buildScheduleSavedMessage_(config),
+  };
+}
+
+/**
+ * Master trigger entry point — runs the task saved in Script Properties.
+ */
+function executeScheduledTask() {
+  var startedAt = Date.now();
+  var schedule = loadSavedScheduleConfig_();
+
+  if (!schedule.configured) {
+    Logger.log('executeScheduledTask: no schedule configured — skipping.');
+    logSchedulerEvent_('Skipped', 'No schedule configured.');
+    return;
+  }
+
+  Logger.log('executeScheduledTask starting: ' + JSON.stringify(schedule));
+
+  try {
+    var completed = [];
+    schedule.taskTypes.forEach(function(taskType) {
+      runScheduledTaskType_(taskType);
+      completed.push(getScheduleTaskLabel_(taskType));
+    });
+
+    var elapsedMs = Date.now() - startedAt;
+    var detail = completed.join(' → ') + ' finished in ' + elapsedMs + 'ms';
+    try {
+      var remainingMs = ScriptApp.getRemainingTime();
+      if (remainingMs > 0 && remainingMs < 60000) {
+        detail += '; low remaining execution time (' + remainingMs + 'ms)';
+        logSchedulerEvent_('Warning', detail);
+      }
+    } catch (ignore) {
+      // getRemainingTime unavailable outside execution context
+    }
+    logSchedulerEvent_('Success', detail);
+  } catch (err) {
+    var message = err && err.message ? err.message : String(err);
+    if (/limit|quota|exceeded|timeout|too many|service invoked/i.test(message)) {
+      message = 'Execution limit or trigger failure: ' + message;
+    }
+    Logger.log('executeScheduledTask failed: ' + message);
+    logSchedulerEvent_('Error', message);
+  }
 }
 
 // --- Web App API ---
@@ -1118,7 +1858,7 @@ function generateDashboardActionDigest() {
 
 /**
  * Web App entry point (POST only).
- * Body: { "action": "cleanup"|"digest"|"archiveReviewed"|"classifyRead", "token": "<WEBAPP_API_SECRET>", "includeRead": false }
+ * Body: { "action": "cleanup"|"digest"|"archiveReviewed"|"classifyRead"|"saveSchedule"|"getSchedule", ... }
  *
  * Deploy: Deploy → New deployment → Web app
  *   Execute as: Me
@@ -1178,9 +1918,40 @@ function doPost(e) {
       });
     }
 
+    if (action === 'saveschedule') {
+      var scheduleResult = saveUserSchedule({
+        taskTypes: payload.taskTypes || payload.taskType,
+        taskType: payload.taskType,
+        frequency: payload.frequency,
+        targetDays: payload.targetDays,
+        targetHour: payload.targetHour,
+      });
+      var savedSchedule = getSavedSchedule();
+      return jsonResponse_({
+        ok: true,
+        action: 'saveSchedule',
+        taskTypes: scheduleResult.taskTypes,
+        taskType: scheduleResult.taskType,
+        frequency: scheduleResult.frequency,
+        targetDays: scheduleResult.targetDays,
+        targetHour: scheduleResult.targetHour,
+        active: savedSchedule.active,
+        configured: savedSchedule.configured,
+        summary: savedSchedule.summary,
+        message: scheduleResult.message,
+      });
+    }
+
+    if (action === 'getschedule') {
+      var schedulePayload = scheduleApiResponse_();
+      schedulePayload.ok = true;
+      schedulePayload.action = 'getSchedule';
+      return jsonResponse_(schedulePayload);
+    }
+
     return jsonResponse_({
       ok: false,
-      error: 'Unknown action. Use "cleanup", "digest", "archiveReviewed", or "classifyRead".',
+      error: 'Unknown action. Use "cleanup", "digest", "archiveReviewed", "classifyRead", "saveSchedule", or "getSchedule".',
     });
   } catch (err) {
     Logger.log('doPost error: ' + err.message);
@@ -1205,10 +1976,46 @@ function generateWebAppApiSecret() {
 function doGet() {
   var template = HtmlService.createTemplateFromFile('dashboard');
   template.webAppUrl = ScriptApp.getService().getUrl();
+  template.savedScheduleJson = JSON.stringify(getSavedSchedule());
   return template.evaluate()
     .setTitle('Gmail Cleanup')
     .addMetaTag('viewport', 'width=device-width, initial-scale=1')
     .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+/** Called from dashboard.html via google.script.run (token stays server-side). */
+function dashboardGetSchedule() {
+  var response = scheduleApiResponse_();
+  response.ok = true;
+  return response;
+}
+
+/** Called from dashboard.html via google.script.run (token stays server-side). */
+function dashboardSaveSchedule(config) {
+  var input = config;
+  if (arguments.length > 1 || (input && input.taskTypes === undefined && input.taskType === undefined && typeof input !== 'object')) {
+    input = {
+      taskTypes: arguments[0],
+      frequency: arguments[1],
+      targetDays: arguments[2],
+      targetHour: arguments[3],
+    };
+  }
+  var result = saveUserSchedule(input);
+  var saved = getSavedSchedule();
+  return {
+    ok: true,
+    action: 'saveSchedule',
+    taskTypes: result.taskTypes,
+    taskType: result.taskType,
+    frequency: result.frequency,
+    targetDays: result.targetDays,
+    targetHour: result.targetHour,
+    active: saved.active,
+    configured: saved.configured,
+    summary: saved.summary,
+    message: result.message,
+  };
 }
 
 /** Called from dashboard.html via google.script.run (token stays server-side). */
